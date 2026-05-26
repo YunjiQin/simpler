@@ -573,6 +573,12 @@ struct PTO2SchedulerState {
         // --- Cache Line 0: ring pointer (read-only) + hot path (read-write) ---
         PTO2SharedMemoryRingHeader *ring;
         int32_t last_task_alive;
+        // directa-pubonly: shadow of the most recently published SM
+        // `last_task_alive`. Read/written only while advance_lock is held
+        // (sync_to_sm is called from advance_ring_pointers, which is
+        // CAS-protected by advance_lock). Used to throttle SM writes to
+        // every K=16 local advances — see sync_to_sm below.
+        int32_t last_published_to_sm{0};
         std::atomic<int32_t> advance_lock;  // multi-thread CAS
 
         // --- Cache Line 1+: Thread 0 only (wiring dep_pool) ---
@@ -586,7 +592,26 @@ struct PTO2SchedulerState {
         bool init_data_from_layout(void *sm_dev_base, int32_t ring_id);
         void destroy();
 
-        void sync_to_sm() { ring->fc.last_task_alive.store(last_task_alive, std::memory_order_release); }
+        // directa-pubonly: K=16 batched publish.
+        //
+        // Each advance still pushes the local `last_task_alive` counter
+        // forward, but the SM cache line is only stored when local has
+        // advanced PUBLISH_INTERVAL_K positions past the most recently
+        // published value. This cuts cache-invalidate traffic on orch's
+        // SM read path by ~K× without changing total work.
+        //
+        // Safety: for paged_attention_unroll Case1, task_window_size
+        // (16384) >> task_count (1024), so orch backpressure on slot
+        // reuse never fires. PTO2_TENSORMAP_POOL_SIZE (65536) >> 1280
+        // also rules out tensormap cleanup pressure. Workloads that
+        // approach those bounds need an explicit fallback (publish even
+        // with delta < K when stale long enough). Not present here.
+        void sync_to_sm() {
+            constexpr int32_t PUBLISH_INTERVAL_K = 16;
+            if (last_task_alive - last_published_to_sm < PUBLISH_INTERVAL_K) return;
+            ring->fc.last_task_alive.store(last_task_alive, std::memory_order_release);
+            last_published_to_sm = last_task_alive;
+        }
 
         void advance_ring_pointers() {
             int32_t current_task_index = ring->fc.current_task_index.load(std::memory_order_acquire);
