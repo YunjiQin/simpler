@@ -185,9 +185,21 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // Read execution parameters from runtime. The 0 → 1 fixup runs before the
     // sched_thread_num_ derivation so a zero input doesn't leave the scheduler
     // count at -1.
+    //
+    // Layout convention (matches ALLOWED_CPUS in platform_aicpu_affinity.cpp):
+    //   thread_idx 0..sched_thread_num_-1     → scheduler
+    //   thread_idx == sched_thread_num_       → wiring thread
+    //   thread_idx == sched_thread_num_ + 1   → orchestrator
+    // So aicpu_thread_num_ = sched_thread_num_ + 2.
     aicpu_thread_num_ = runtime->aicpu_thread_num;
     if (aicpu_thread_num_ == 0) aicpu_thread_num_ = 1;
-    sched_thread_num_ = aicpu_thread_num_ - 1;
+    if (aicpu_thread_num_ >= 2) {
+        sched_thread_num_ = aicpu_thread_num_ - 2;
+    } else {
+        // Degenerate config (no wiring thread room) — fall back to old layout
+        // for back-compat; the sched takes over wiring inside its main loop.
+        sched_thread_num_ = aicpu_thread_num_ - 1;
+    }
     orch_to_sched_ = runtime->orch_to_sched;
 
     if (aicpu_thread_num_ < 1 || aicpu_thread_num_ > MAX_AICPU_THREADS) {
@@ -221,8 +233,33 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     int32_t run_rc = 0;
     LOG_INFO_V0("Thread %d: Start", thread_idx);
 
+    // Role classification (matches ALLOWED_CPUS layout):
+    //   thread_idx 0..sched_thread_num_-1     → sched
+    //   thread_idx == sched_thread_num_       → wiring (when aicpu_thread_num_ >= 3)
+    //   thread_idx == sched_thread_num_ + 1   → orch  (when aicpu_thread_num_ >= 2)
+    // When aicpu_thread_num_ < 3 there is no wiring slot; orch is at
+    // sched_thread_num_ and the wiring branch below is skipped.
+    const bool is_orch = (thread_idx == aicpu_thread_num_ - 1);
+    const bool is_wiring = (aicpu_thread_num_ >= 3) && (thread_idx == aicpu_thread_num_ - 2);
+
+    // Wiring-thread stub (step 1: no work yet — spin until shutdown signal).
+    // Future commits will move drain_wiring_queue / advance_ring_pointers /
+    // sync_to_sm / dep_pool.reclaim here.
+    if (is_wiring) {
+        LOG_INFO_V0("Thread %d: wiring thread entry (stub)", thread_idx);
+        while (!runtime_init_ready_.load(std::memory_order_acquire)) {
+            SPIN_WAIT_HINT();
+        }
+        while (!sched_ctx_.is_completed()) {
+            SPIN_WAIT_HINT();
+        }
+        LOG_INFO_V0("Thread %d: wiring thread exit", thread_idx);
+        // Skip the orch path entirely; sched path below will be skipped because
+        // thread_idx is not < sched_thread_num_.
+    }
+
     // Orchestrator check
-    if (thread_idx >= sched_thread_num_) {
+    if (is_orch) {
 #if PTO2_PROFILING
         uint64_t orch_cycle_start = 0;
         int32_t submitted_tasks = -1;

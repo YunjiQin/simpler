@@ -19,7 +19,7 @@
 #include "common/unified_log.h"
 
 // =============================================================================
-// A5 AICPU affinity gate — 1 orch + 4 sched placement
+// A5 AICPU affinity gate — 1 orch + 1 wiring + 4 sched placement
 // =============================================================================
 //
 // AICPU topology (A5 / DAV_3510, Full SKU verified on device 0, OCCUPY=0x7ffe):
@@ -28,53 +28,56 @@
 //   SMT enabled on phy 1..7 -> 2 logical CPUs per phy_cpu (ht 0 + ht 1)
 //   AICPU cluster mapping: cluster_id = phy_cpu_id / 2, die_id = phy_cpu_id / 4
 //
-// Placement intent (directa-stage1: single-die 1 orch + 4 sched, all on die 1):
-//   orch_die       = 1 (die 0 carries reserved phy 0 -> avoid it entirely)
-//   orch_cluster   = 2 (cpu 7..10)
-//   remote_cluster = 3 (cpu 11..14)  — within-die cross-cluster, NOT cross-die
+// Placement intent (wiring-thread split, single-die, all on die 1):
 //
-//   orch    = cpu_id  9  (cluster 2 / phy 5 ht 0)            — alone on phy 5
-//   sched 0 = cpu_id  7  (cluster 2 / phy 4 ht 0)            — local wiring sched
-//   sched 1 = cpu_id  8  (cluster 2 / phy 4 ht 1)            — local SMT sibling of sched 0
-//   sched 2 = cpu_id 11  (cluster 3 / phy 6 ht 0)            — same-die remote-cluster sched
-//   sched 3 = cpu_id 13  (cluster 3 / phy 7 ht 0)            — same-die remote-cluster sched
+//   cluster 2 (orch + wiring; ring/graph state stays cluster-local):
+//     cpu  9 (phy 5 ht 0) → orch          — alone on phy 5
+//     cpu  7 (phy 4 ht 0) → wiring        — alone on phy 4
+//     (cpu  8 unused; cpu 10 not in CANN dispatch set under launch budget 7)
 //
-// Rationale: the baseline 1+4 had sched 2/3 on die 0 cluster 1 — cross-die
-// from orch. Hot sync paths (SM `current_task_index`, `last_task_alive`,
-// `aicore_mailbox`) were all cross-die polls/stores in the dispatch loop,
-// blocking forward progress every iteration. directa-stage1 moves both
-// remote scheds onto die-1 cluster 3 so every sched↔orch sync line stays
-// within die 1. AICore mapping is NOT remapped: sched 2/3 will now dispatch
-// cross-die to die-0 AICores (via MMIO, write-buffered → async), and
-// AICore→sched mailbox reads may go cross-die depending on mailbox placement.
-// The trade is sync-coherence cross-die → async-MMIO cross-die.
+//   cluster 3 (4 schedulers, 2 SMT pairs):
+//     cpu 11 (phy 6 ht 0) → sched 0       — SMT pair w/ sched 1
+//     cpu 12 (phy 6 ht 1) → sched 1
+//     cpu 13 (phy 7 ht 0) → sched 2       — SMT pair w/ sched 3
+//     cpu 14 (phy 7 ht 1) → sched 3
 //
-// NOTE: orch_phy and sched_pair_phy could be either {phy 4, phy 5}. We use
-// phy 4 for the sched pair (cpu_id 7/8) because CANN's worker dispatch hits
-// both SMT siblings reliably on phy 4; cpu_id 10 (= phy 5 ht 1) is NOT in
-// CANN's observed dispatch set on this device under the current
-// PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH=7 launch budget.
+// Rationale:
+//   * Graph state (wiring_queue, current_task_index, last_task_alive, dep_pool)
+//     is touched only by orch + wiring → keep both in cluster 2 so those cache
+//     lines stay cluster-local; orch's stores reach wiring without cluster snoop.
+//   * Per-task scheduling state (tracker bitmaps, has_idle peer reads, async
+//     wait list lock) is touched only by the 4 sched threads → cluster 3
+//     internal snoop, no cross-cluster atomic chain.
+//   * The two SMT pairs in cluster 3 cost ~40% per thread under contention,
+//     so 4 sched ≈ 3.2× single-thread throughput rather than 4×. Trade-off
+//     accepted: gives 4 polling threads for AIC COND-register fan-out while
+//     keeping all sched coherence traffic inside one cluster.
+//
+// Single-producer chains created by this layout:
+//   * orch       → wiring_queue → wiring         (cluster-2 internal)
+//   * wiring     → ready_queues                  (single producer → MPSC for sched)
+//   * wiring     → last_task_alive (SM)          (single writer; no advance_lock CAS)
 //
 // ALLOWED_CPUS ordering convention:
-//   indices 0..N-2 are scheduler slots (thread_idx assigned in this order),
+//   indices 0..N-3 are scheduler slots (thread_idx assigned in this order),
+//   index  N-2   is the wiring slot,
 //   index  N-1   is the orchestrator slot.
 //
-// PG variants (3-cluster SKUs): NOT auto-detected. Single-die placement only
-// works on SKUs where two clusters are alive on die 1. Re-derive ALLOWED_CPUS
-// by running ~/simpler/basics/00-aicpu-num/launcher on the target device and
-// reading the AICPU+OCCUPY bitmap. Expected tables:
-//   Full   (OCCUPY=0x7ffe):  {7, 8, 11, 13, 9}   die-1 cluster 2 + 3 (this file)
-//   PG-a   (cluster 0 dead, OCCUPY=0x7ff8): same as Full
-//   PG-b   (cluster 2 dead, OCCUPY=0x79fe): single-die infeasible (only one
-//                                           cluster alive on die 1)
-//   PG-c   (cluster 3 dead, OCCUPY=0x1ffe): single-die infeasible (only one
-//                                           cluster alive on die 1)
+// PG variants (3-cluster SKUs): NOT auto-detected. This layout assumes two
+// live clusters on die 1. Re-derive ALLOWED_CPUS by running
+// ~/simpler/basics/00-aicpu-num/launcher on the target device and reading
+// the AICPU+OCCUPY bitmap. cpu 12 / cpu 14 must be in CANN's dispatch set
+// under PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH=7 — if not, this layout
+// silently loses sched threads and falls back to the index-based survivor
+// rule.
 // =============================================================================
-// directa-stage1: 1 orch + 4 sched single-die (cluster 2 = orch local, cluster 3 = same-die remote).
-// Last entry is the orchestrator; earlier entries are schedulers in thread_idx order.
-// The gate forces each surviving thread onto its slot's cpu_id via
-// sched_setaffinity, so CANN's worker→cpu dispatch order doesn't matter.
-static constexpr int32_t ALLOWED_CPUS[] = {7, 8, 11, 13, 9};
+// 1 orch + 1 wiring + 4 sched, all on die 1.
+// Last entry is the orchestrator; second-last is the wiring thread; earlier
+// entries are schedulers in thread_idx order. The gate identifies each
+// surviving thread by its CANN-dispatched cpu_id (we do NOT call
+// sched_setaffinity), so cpu 12 / cpu 14 must already be in CANN's launch
+// set for this layout to populate all 4 sched slots.
+static constexpr int32_t ALLOWED_CPUS[] = {11, 12, 13, 14, 7, 9};
 static constexpr int32_t ALLOWED_CPU_COUNT = sizeof(ALLOWED_CPUS) / sizeof(ALLOWED_CPUS[0]);
 
 // Slot-claim counter: each gate call fetch_adds to get its slot index.
@@ -153,9 +156,16 @@ bool platform_aicpu_affinity_gate(int32_t /*logical_count*/, int32_t total_launc
     if (!survive) {
         LOG_INFO_V0("AICPU affinity gate: thread idx=%d cpu=%d DROPPED", idx, cpu);
     } else {
+        const char *role;
+        if (tl_exec_idx == ALLOWED_CPU_COUNT - 1) {
+            role = "ACTIVE(orch)";
+        } else if (tl_exec_idx == ALLOWED_CPU_COUNT - 2) {
+            role = "ACTIVE(wiring)";
+        } else {
+            role = "ACTIVE(sched)";
+        }
         LOG_INFO_V0(
-            "AICPU affinity gate: thread idx=%d cpu=%d exec_idx=%d %s", idx, cpu, tl_exec_idx,
-            tl_exec_idx == ALLOWED_CPU_COUNT - 1 ? "ACTIVE(orch)" : "ACTIVE(sched)"
+            "AICPU affinity gate: thread idx=%d cpu=%d exec_idx=%d %s", idx, cpu, tl_exec_idx, role
         );
     }
     return survive;
