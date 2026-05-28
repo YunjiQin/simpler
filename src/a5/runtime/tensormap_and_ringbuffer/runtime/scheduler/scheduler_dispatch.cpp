@@ -38,6 +38,17 @@ namespace {
 inline constexpr int32_t PTO2_DEFERRED_RELEASE_CAP = 256;
 }
 
+// =============================================================================
+// DIAG: dispatch ramp-up probe
+// Sample first N iterations per sched thread: ready queue depth + idle/pending
+// core counts + did_dispatch. Dump at sched_end. Pure observability — no
+// behaviour change. Struct/macros live in scheduler_types.h so cold_path can
+// dump.
+// =============================================================================
+#if DIAG_DISPATCH_RAMP
+DiagRampState g_diag_ramp[MAX_AICPU_THREADS]{};
+#endif
+
 const char *SchedulerContext::shape_name(PTO2ResourceShape shape) {
     switch (shape) {
     case PTO2ResourceShape::AIC:
@@ -264,10 +275,26 @@ void SchedulerContext::dispatch_shape(
     auto cores = tracker.get_dispatchable_cores(shape, phase);
     if (!cores.has_value()) return;
 
+#if DIAG_DISPATCH_RAMP
+    bool diag_first_iter = true;
+#endif
     while (cores.has_value() && !entered_drain) {
         int want = cores.count();
         PTO2TaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
+#if DIAG_DISPATCH_RAMP
+        uint64_t diag_q_size_before = (shape == PTO2ResourceShape::AIC && phase == CoreTracker::DispatchPhase::IDLE) ?
+            sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIC)].size() : 0;
+#endif
         int got = pop_ready_tasks_batch(shape, thread_idx, local_buf, batch, want);
+#if DIAG_DISPATCH_RAMP
+        if (diag_first_iter && got == 0 && shape == PTO2ResourceShape::AIC &&
+            phase == CoreTracker::DispatchPhase::IDLE && diag_q_size_before > 0) {
+            DiagRampState &dr = g_diag_ramp[thread_idx];
+            dr.aic_pop_race_count++;
+            dr.iter_pop_race_aic = true;
+        }
+        diag_first_iter = false;
+#endif
         if (got == 0) break;
 
         bool dispatched_any = false;
@@ -322,6 +349,11 @@ void SchedulerContext::dispatch_shape(
                 auto core_offset = cores.pop_first();
                 dispatch_block(runtime, thread_idx, core_offset, *slot_state, shape, is_pending, start + b);
             }
+#if DIAG_DISPATCH_RAMP
+            if (shape == PTO2ResourceShape::AIC) {
+                g_diag_ramp[thread_idx].iter_dispatched_aic_count += static_cast<uint32_t>(claim);
+            }
+#endif
             made_progress = true;
 #if PTO2_SCHED_PROFILING
             l2_perf.sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
@@ -405,6 +437,9 @@ void SchedulerContext::dispatch_ready_tasks(
     // MIX-PENDING below still runs — that is the core of "mix strict priority":
     // pending slots are spent on mix before AIC/AIV get any chance.
     bool skip_aic_aiv = has_residual_mix(local_bufs[MIX_I]);
+#if DIAG_DISPATCH_RAMP
+    if (skip_aic_aiv) g_diag_ramp[thread_idx].iter_mix_residual_blocked_aic = true;
+#endif
 
     if (!skip_aic_aiv) {
         for (int i = 0; i < 2; i++) {
@@ -452,7 +487,10 @@ void SchedulerContext::dispatch_ready_tasks(
     if (skip_aic_aiv) return;
 
     // AIC/AIV-PENDING gate: a peer-idle skip is a delay, not a loss — the peer
-    // will pull from the global queue on its next IDLE pass.
+    // will pull from the global queue on its next IDLE pass. Confirmed by the
+    // gate-OFF experiment: removing this gate regresses wall by +61us at
+    // bd36 because 50% of AIC tasks then take the PENDING path (~22us head_oh)
+    // instead of IDLE (~1us head_oh).
     for (int i = 0; i < 2; i++) {
         PTO2ResourceShape s = aic_aiv[i];
         if (has_idle_in_other_threads(thread_idx, s)) continue;
@@ -551,6 +589,17 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         l2_perf.sched_loop_count++;
         uint64_t _t0_phase = _t0;
 #endif
+#if DIAG_DISPATCH_RAMP
+        // Reset per-iter scratch at iter start
+        {
+            DiagRampState &dr = g_diag_ramp[thread_idx];
+            dr.iter_complete_cycles = 0;
+            dr.iter_dispatched_aic_count = 0;
+            dr.iter_drain_triggered = false;
+            dr.iter_mix_residual_blocked_aic = false;
+            dr.iter_pop_race_aic = false;
+        }
+#endif
         int32_t task_count = 0;
         if (!tracker.has_any_running_cores()) {
             LoopAction action = handle_orchestrator_exit(thread_idx, header, runtime, task_count);
@@ -570,12 +619,20 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         int32_t completed_this_turn = 0;
 
         bool try_completed = tracker.has_any_running_cores();
+#if DIAG_DISPATCH_RAMP
+        uint64_t diag_complete_start = try_completed ? get_sys_cnt_aicpu() : 0;
+#endif
         if (try_completed) {
             check_running_cores_for_completion(
                 thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress,
                 deferred_release_slot_states, deferred_release_count, local_bufs
             );
         }
+#if DIAG_DISPATCH_RAMP
+        if (try_completed) {
+            g_diag_ramp[thread_idx].iter_complete_cycles = get_sys_cnt_aicpu() - diag_complete_start;
+        }
+#endif
         if (completed_this_turn > 0) {
 #if PTO2_SCHED_PROFILING
             sched_->tasks_completed.fetch_add(completed_this_turn, std::memory_order_relaxed);
@@ -651,6 +708,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 2 drain check
         if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
+#if DIAG_DISPATCH_RAMP
+            g_diag_ramp[thread_idx].iter_drain_triggered = true;
+#endif
             handle_drain_mode(runtime, thread_idx);
             continue;
         }
@@ -713,7 +773,72 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // Phase 4: MIX-strict-priority dispatch with phase-split and
         // cross-thread idle gating. See dispatch_ready_tasks for the policy.
         const bool pmu_active = is_pmu_enabled();
+#if DIAG_DISPATCH_RAMP
+        // Sample state BEFORE dispatch_ready_tasks call. Read ready queue
+        // sizes (relaxed loads, MPMC) and tracker idle/pending counts
+        // (popcount of local bitmaps — no atomic).
+        DiagRampState &diag = g_diag_ramp[thread_idx];
+        uint64_t diag_ready_mix = sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::MIX)].size();
+        uint64_t diag_ready_aic = sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIC)].size();
+        uint64_t diag_ready_aiv = sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIV)].size();
+        uint32_t diag_idle_mix = tracker.get_idle_core_offset_states(PTO2ResourceShape::MIX).count();
+        uint32_t diag_idle_aic = tracker.get_idle_core_offset_states(PTO2ResourceShape::AIC).count();
+        uint32_t diag_idle_aiv = tracker.get_idle_core_offset_states(PTO2ResourceShape::AIV).count();
+        uint32_t diag_pend_aic = tracker.get_pending_core_offset_states(PTO2ResourceShape::AIC).count();
+        uint32_t diag_pend_aiv = tracker.get_pending_core_offset_states(PTO2ResourceShape::AIV).count();
+        bool diag_had_ready = (diag_ready_mix + diag_ready_aic + diag_ready_aiv) > 0;
+        bool diag_had_idle = (diag_idle_mix + diag_idle_aic + diag_idle_aiv) > 0;
+        bool diag_had_pend = (diag_pend_aic + diag_pend_aiv) > 0;
+        uint64_t diag_now = get_sys_cnt_aicpu();
+        if (diag_had_ready && diag.first_ready_ts == 0) diag.first_ready_ts = diag_now;
+#endif
         dispatch_ready_tasks(runtime, thread_idx, tracker, local_bufs, pmu_active, made_progress, try_pushed);
+#if DIAG_DISPATCH_RAMP
+        uint64_t diag_after = get_sys_cnt_aicpu();
+        if (try_pushed && diag.first_dispatch_ts == 0) diag.first_dispatch_ts = diag_after;
+        // Counter buckets
+        if (diag_had_ready && (diag_had_idle || diag_had_pend) && !try_pushed) diag.blocked_iters++;
+        else if (!diag_had_ready && diag_had_idle) diag.starved_iters++;
+        else if (diag_had_ready && !diag_had_idle && !diag_had_pend) diag.saturated_iters++;
+
+        // STALL classification: AIC-side "ready+idle+no-dispatch"
+        // Cross-sched view: count peer idle AIC count
+        uint32_t peer_idle_aic = 0;
+        for (int32_t t = 0; t < active_sched_threads_; t++) {
+            if (t == thread_idx) continue;
+            peer_idle_aic += core_trackers_[t].get_idle_core_offset_states(PTO2ResourceShape::AIC).count();
+        }
+        bool any_idle_aic_global = (diag_idle_aic + peer_idle_aic) > 0;
+        bool any_ready_aic = diag_ready_aic > 0;
+        bool dispatched_aic = diag.iter_dispatched_aic_count > 0;
+        if (any_idle_aic_global && any_ready_aic && !dispatched_aic) {
+            diag.stall_total++;
+            bool classified = false;
+            if (diag.iter_drain_triggered) { diag.stall_drain_mode++; classified = true; }
+            if (cycles_to_us(diag.iter_complete_cycles) > 20.0) { diag.stall_complete_long++; classified = true; }
+            if (diag.iter_mix_residual_blocked_aic) { diag.stall_mix_residual_blocked_aic++; classified = true; }
+            if (diag.iter_pop_race_aic) { diag.stall_pop_race++; classified = true; }
+            if (diag_idle_aic == 0 && peer_idle_aic > 0) { diag.stall_my_idle_zero_peer_nonzero++; classified = true; }
+            if (!classified) diag.stall_unknown++;
+        }
+        // Sample trace (first N iters with any state)
+        if (diag.count < DIAG_RAMP_SAMPLES) {
+            uint64_t rel = (l2_perf.sched_start_ts > 0 && diag_now > l2_perf.sched_start_ts) ?
+                cycles_to_us(diag_now - l2_perf.sched_start_ts) : 0;
+            DiagRampSample &s = diag.samples[diag.count++];
+            s.ts_rel = static_cast<uint32_t>(rel);
+            s.ready_mix = static_cast<uint16_t>(diag_ready_mix);
+            s.ready_aic = static_cast<uint16_t>(diag_ready_aic);
+            s.ready_aiv = static_cast<uint16_t>(diag_ready_aiv);
+            s.idle_mix = static_cast<uint8_t>(diag_idle_mix);
+            s.idle_aic = static_cast<uint8_t>(diag_idle_aic);
+            s.idle_aiv = static_cast<uint8_t>(diag_idle_aiv);
+            s.pend_aic = static_cast<uint8_t>(diag_pend_aic);
+            s.pend_aiv = static_cast<uint8_t>(diag_pend_aiv);
+            s.did_dispatch = try_pushed ? 1 : 0;
+        }
+        (void)diag_after;
+#endif
 
 #if PTO2_PROFILING
         if (!try_pushed) {

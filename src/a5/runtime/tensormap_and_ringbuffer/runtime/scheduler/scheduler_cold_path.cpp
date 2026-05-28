@@ -386,6 +386,61 @@ void SchedulerContext::log_l2_perf_summary(int32_t thread_idx, int32_t cur_threa
         cycles_to_us(sched_end_ts - l2_perf.sched_start_ts)
     );
 
+#if DIAG_DISPATCH_RAMP
+    {
+        DiagRampState &d = g_diag_ramp[thread_idx];
+        double first_ready_us = d.first_ready_ts > l2_perf.sched_start_ts ?
+            cycles_to_us(d.first_ready_ts - l2_perf.sched_start_ts) : -1.0;
+        double first_disp_us = d.first_dispatch_ts > l2_perf.sched_start_ts ?
+            cycles_to_us(d.first_dispatch_ts - l2_perf.sched_start_ts) : -1.0;
+        LOG_INFO_V9(
+            "Thread %d: DIAG_RAMP first_ready=%.2fus first_dispatch=%.2fus "
+            "blocked_iters=%" PRIu64 " starved_iters=%" PRIu64 " saturated_iters=%" PRIu64
+            " aic_pend_gated_iters=%" PRIu64 " avg_pend_slots=%.1f avg_ready=%.1f",
+            thread_idx, first_ready_us, first_disp_us,
+            d.blocked_iters, d.starved_iters, d.saturated_iters,
+            d.aic_pending_gated_iters,
+            d.aic_pending_gated_iters > 0 ? (double)d.aic_pending_gated_slot_count / d.aic_pending_gated_iters : 0.0,
+            d.aic_pending_gated_iters > 0 ? (double)d.aic_pending_gated_ready_count / d.aic_pending_gated_iters : 0.0
+        );
+        LOG_INFO_V9(
+            "Thread %d: DIAG_STALL total=%" PRIu64
+            " r1_complete_long=%" PRIu64 " r2_drain=%" PRIu64 " r3_pop_race=%" PRIu64
+            " r5_mix_residual=%" PRIu64 " r7_my_idle_zero=%" PRIu64 " unknown=%" PRIu64
+            " aic_pop_race_total=%" PRIu64,
+            thread_idx, d.stall_total,
+            d.stall_complete_long, d.stall_drain_mode, d.stall_pop_race,
+            d.stall_mix_residual_blocked_aic, d.stall_my_idle_zero_peer_nonzero, d.stall_unknown,
+            d.aic_pop_race_count
+        );
+        for (int32_t i = 0; i < d.count; i++) {
+            const DiagRampSample &s = d.samples[i];
+            LOG_INFO_V9(
+                "Thread %d: DIAG_RAMP[%3d] t=%5uus rdy(M/A/V)=%u/%u/%u "
+                "idle(M/A/V)=%u/%u/%u pend(A/V)=%u/%u disp=%u",
+                thread_idx, i, s.ts_rel,
+                s.ready_mix, s.ready_aic, s.ready_aiv,
+                s.idle_mix, s.idle_aic, s.idle_aiv,
+                s.pend_aic, s.pend_aiv, s.did_dispatch
+            );
+        }
+        // Reset for next round
+        d.count = 0; d.first_ready_ts = 0; d.first_dispatch_ts = 0;
+        d.blocked_iters = 0; d.starved_iters = 0; d.saturated_iters = 0;
+        d.aic_pending_gated_iters = 0;
+        d.aic_pending_gated_slot_count = 0;
+        d.aic_pending_gated_ready_count = 0;
+        d.stall_total = 0;
+        d.stall_my_idle_zero_peer_nonzero = 0;
+        d.stall_complete_long = 0; d.stall_drain_mode = 0;
+        d.stall_mix_residual_blocked_aic = 0; d.stall_pop_race = 0; d.stall_unknown = 0;
+        d.aic_pop_race_count = 0;
+        d.iter_complete_cycles = 0; d.iter_dispatched_aic_count = 0;
+        d.iter_drain_triggered = false; d.iter_mix_residual_blocked_aic = false;
+        d.iter_pop_race_aic = false;
+    }
+#endif
+
     uint64_t sched_total = l2_perf.sched_wiring_cycle + l2_perf.sched_complete_cycle + l2_perf.sched_scan_cycle +
                            l2_perf.sched_dispatch_cycle + l2_perf.sched_idle_cycle;
     if (sched_total == 0) sched_total = 1;
