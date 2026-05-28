@@ -38,8 +38,11 @@
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
 
-#if PTO2_SCHED_PROFILING
+// Lifecycle profiling: wire_task / release_fanin_and_check_ready stamp
+// fanin_zero_cycles + enter_global_queue_cycles via get_sys_cnt_aicpu().
 #include "aicpu/device_time.h"
+
+#if PTO2_SCHED_PROFILING
 #define PTO2_SCHED_CYCLE_START() uint64_t _st0 = get_sys_cnt_aicpu(), _st1
 #define PTO2_SCHED_CYCLE_LAP(acc)   \
     do {                            \
@@ -774,9 +777,19 @@ struct PTO2SchedulerState {
             int32_t init_rc = early_finished + 1;
             int32_t new_rc = ws->fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
             if (new_rc >= ws->fanin_count) {
+                // All producers already finished at wire time — task is immediately
+                // ready. orch publishes directly to global queue (no local_buf), so
+                // fanin_zero == enter_global_queue.
+                uint64_t now = get_sys_cnt_aicpu();
+                ws->fanin_zero_cycles = now;
+                ws->enter_global_queue_cycles = now;
                 push_ready_routed(ws);
             }
         } else {
+            // No fanin → ready at orch-wire time. Direct push to global queue.
+            uint64_t now = get_sys_cnt_aicpu();
+            ws->fanin_zero_cycles = now;
+            ws->enter_global_queue_cycles = now;
             ws->fanin_refcount.fetch_add(1, std::memory_order_acq_rel);
             push_ready_routed(ws);
         }
@@ -867,6 +880,9 @@ struct PTO2SchedulerState {
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
 
         if (new_refcount == slot_state.fanin_count) {
+            // Last producer brought fanin to 0 → task is logically ready.
+            uint64_t now = get_sys_cnt_aicpu();
+            slot_state.fanin_zero_cycles = now;
             // Local-first: try per-CoreType thread-local buffer before global queue
             // Route by active_mask: AIC-containing tasks → buf[0], AIV-only → buf[1]
             // DUMMY shape is out of range for local_bufs (sized PTO2_NUM_RESOURCE_SHAPES);
@@ -874,9 +890,14 @@ struct PTO2SchedulerState {
             PTO2ResourceShape shape = slot_state.active_mask.to_shape();
             if (shape == PTO2ResourceShape::DUMMY) {
                 dummy_ready_queue.push(&slot_state);
+                slot_state.enter_global_queue_cycles = now;
             } else if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
                 ready_queues[static_cast<int32_t>(shape)].push(&slot_state);
+                slot_state.enter_global_queue_cycles = now;
             }
+            // else: pushed to sched-local buf; enter_global_queue_cycles stays 0
+            // (set later by flush_local_bufs if it spills to global, or remains 0
+            // if same sched consumes it directly).
             return true;
         }
         return false;
@@ -891,6 +912,8 @@ struct PTO2SchedulerState {
         atomic_count += 1;  // fanin_refcount.fetch_add
 
         if (new_refcount == slot_state.fanin_count) {
+            uint64_t now = get_sys_cnt_aicpu();
+            slot_state.fanin_zero_cycles = now;
             // Local-first: try per-CoreType thread-local buffer before global queue.
             // Dummy slots bypass local_bufs (out-of-range for PTO2_NUM_RESOURCE_SHAPES)
             // and go straight to dummy_ready_queue; use the profiling-aware push so
@@ -898,8 +921,10 @@ struct PTO2SchedulerState {
             PTO2ResourceShape shape = slot_state.active_mask.to_shape();
             if (shape == PTO2ResourceShape::DUMMY) {
                 dummy_ready_queue.push(&slot_state, atomic_count, push_wait);
+                slot_state.enter_global_queue_cycles = now;
             } else if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
                 ready_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);
+                slot_state.enter_global_queue_cycles = now;
             }
             return true;
         }

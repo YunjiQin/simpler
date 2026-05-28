@@ -370,6 +370,15 @@ void SchedulerContext::dispatch_ready_tasks(
             l2_perf.local_overflow_count += lb.count;
 #endif
             if (lb.count > 0) {
+                // Tag enter_global_queue_cycles for any task whose release path
+                // had only set fanin_zero_cycles (entered via local_buf, never
+                // through the global queue until now).
+                uint64_t now = get_sys_cnt_aicpu();
+                for (int32_t i = 0; i < lb.count; i++) {
+                    if (lb.slot_states[i]->enter_global_queue_cycles == 0) {
+                        lb.slot_states[i]->enter_global_queue_cycles = now;
+                    }
+                }
                 sched_->ready_queues[s].push_batch(lb.slot_states, lb.count);
                 lb.count = 0;
             }

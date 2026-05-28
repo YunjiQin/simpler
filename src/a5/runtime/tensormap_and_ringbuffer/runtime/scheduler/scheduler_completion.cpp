@@ -184,8 +184,8 @@ void SchedulerContext::complete_slot_task(
         int32_t perf_slot_idx = static_cast<int32_t>(subslot);
         if (l2_perf_aicpu_complete_record(
                 core_id, thread_idx, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
-                slot_state.task->kernel_id[perf_slot_idx], hank[core_id].core_type, dispatch_ts, finish_ts, fanout_arr,
-                fanout_n
+                slot_state.task->kernel_id[perf_slot_idx], hank[core_id].core_type, dispatch_ts, finish_ts,
+                slot_state.fanin_zero_cycles, slot_state.enter_global_queue_cycles, fanout_arr, fanout_n
             ) != 0) {
             LOG_ERROR(
                 "Core %d: l2_perf_aicpu_complete_record failed for task 0x%" PRIx64, core_id,

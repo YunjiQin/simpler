@@ -221,7 +221,8 @@ static void switch_records_buffer(int core_id, int thread_idx) {
 
 int l2_perf_aicpu_complete_record(
     int core_id, int thread_idx, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
-    uint64_t dispatch_time, uint64_t finish_time, const uint64_t *fanout, int32_t fanout_count
+    uint64_t dispatch_time, uint64_t finish_time, uint64_t fanin_zero_time, uint64_t enter_global_queue_time,
+    const uint64_t *fanout, int32_t fanout_count
 ) {
     if (core_id < 0 || core_id >= PLATFORM_MAX_CORES) {
         return -1;
@@ -287,6 +288,8 @@ int l2_perf_aicpu_complete_record(
     if (g_l2_perf_level >= L2PerfLevel::AICPU_TIMING) {
         record->dispatch_time = dispatch_time;
         record->finish_time = finish_time;
+        record->fanin_zero_time = fanin_zero_time;
+        record->enter_global_queue_time = enter_global_queue_time;
         if (fanout != nullptr && fanout_count > 0) {
             int32_t n = (fanout_count > RUNTIME_MAX_FANOUT) ? RUNTIME_MAX_FANOUT : fanout_count;
             for (int32_t i = 0; i < n; i++) {
@@ -299,6 +302,8 @@ int l2_perf_aicpu_complete_record(
     } else {
         record->dispatch_time = 0;
         record->finish_time = 0;
+        record->fanin_zero_time = 0;
+        record->enter_global_queue_time = 0;
         record->fanout_count = 0;
     }
 
