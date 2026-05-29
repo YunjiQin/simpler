@@ -77,7 +77,7 @@
 // surviving thread by its CANN-dispatched cpu_id (we do NOT call
 // sched_setaffinity), so cpu 12 / cpu 14 must already be in CANN's launch
 // set for this layout to populate all 4 sched slots.
-static constexpr int32_t ALLOWED_CPUS[] = {11, 12, 13, 14, 7, 9};
+static constexpr int32_t ALLOWED_CPUS[] = {7, 8, 3, 4, 5, 6};
 static constexpr int32_t ALLOWED_CPU_COUNT = sizeof(ALLOWED_CPUS) / sizeof(ALLOWED_CPUS[0]);
 
 // Slot-claim counter: each gate call fetch_adds to get its slot index.
