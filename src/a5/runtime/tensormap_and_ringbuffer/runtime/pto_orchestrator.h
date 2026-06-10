@@ -39,11 +39,11 @@
 
 /**
  * Layout descriptor produced by PTO2OrchestratorState::reserve_layout(). Holds
- * arena offsets for every sub-region the orchestrator owns (per-ring fanin
- * pools, scope arrays, plus the nested PTO2TensorMap layout).
+ * arena offsets for every sub-region the orchestrator owns (scope arrays plus
+ * the nested PTO2TensorMap layout). Fanin spill entries are SM-resident so no
+ * arena offset is needed for them.
  */
 struct PTO2OrchestratorLayout {
-    size_t off_fanin_pool[PTO2_MAX_RING_DEPTH];
     size_t off_scope_tasks;
     size_t off_scope_begins;
     PTO2TensorMapLayout tensor_map;
@@ -151,9 +151,11 @@ struct PTO2OrchestratorState {
     );
 
     // Phase 3b: write the arena-internal pointer fields (scope_tasks,
-    // scope_begins, rings[].fanin_pool.base, tensor_map.{buckets,entry_pool,
-    // free_entry_list,task_entry_heads}, scheduler reference).
+    // scope_begins, tensor_map.{buckets,entry_pool,free_entry_list,
+    // task_entry_heads}, scheduler reference).
     // Idempotent — host runs once on the image, AICPU runs once after attach.
+    // Does NOT touch sm_header; sm_header writes happen via init_sm_fanin_pools
+    // on AICPU side only.
     void wire_arena_pointers(const PTO2OrchestratorLayout &layout, DeviceArena &arena, PTO2SchedulerState *scheduler);
 
     // Forget pointers; arena owns the backing buffers.

@@ -37,13 +37,12 @@ static void latch_pool_error(std::atomic<int32_t> *error_code_ptr, int32_t error
 void PTO2FaninPool::reclaim(PTO2SharedMemoryRingHeader &ring, int32_t sm_last_task_alive) {
     if (sm_last_task_alive <= reclaim_task_cursor) return;
 
+    // Spill pool is per-ring, and reclaim is called with its owning ring —
+    // every payload in `ring` shares this pool, so no per-payload pool check
+    // is needed.
     int32_t scan_end = sm_last_task_alive;
     for (int32_t task_id = reclaim_task_cursor; task_id < scan_end; ++task_id) {
         PTO2TaskPayload &payload = ring.get_payload_by_task_id(task_id);
-        if (payload.fanin_spill_pool != this) {
-            continue;
-        }
-
         int32_t inline_count = std::min(payload.fanin_actual_count, PTO2_FANIN_INLINE_CAP);
         int32_t spill_edge_count = payload.fanin_actual_count - inline_count;
         if (spill_edge_count > 0) {

@@ -191,11 +191,9 @@ PTO2OrchestratorLayout PTO2OrchestratorState::reserve_layout(
     layout.scope_tasks_cap = PTO2_SCOPE_TASKS_CAP;
     layout.scope_stack_capacity = PTO2_MAX_SCOPE_DEPTH;
 
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        const size_t fanin_pool_bytes =
-            PTO2_ALIGN_UP(static_cast<size_t>(dep_pool_capacity) * sizeof(PTO2FaninSpillEntry), PTO2_ALIGN_SIZE);
-        layout.off_fanin_pool[r] = arena.reserve(fanin_pool_bytes, PTO2_ALIGN_SIZE);
-    }
+    // fanin spill entries used to live in this arena; they now live in SM
+    // (allocated by PTO2SharedMemoryHandle::setup_pointers_per_ring) so no
+    // per-ring reservation is needed here.
     layout.off_scope_tasks = arena.reserve(
         static_cast<size_t>(layout.scope_tasks_cap) * sizeof(PTO2TaskSlotState *), alignof(PTO2TaskSlotState *)
     );
@@ -234,12 +232,10 @@ bool PTO2OrchestratorState::init_data_from_layout(
             task_descs_dev, static_cast<int32_t>(task_window_size), cur_idx_dev, last_alive_dev, ring_heap_base,
             heap_size, orch_err
         );
-
-        const size_t fanin_pool_bytes =
-            PTO2_ALIGN_UP(static_cast<size_t>(layout.dep_pool_capacity) * sizeof(PTO2FaninSpillEntry), PTO2_ALIGN_SIZE);
-        auto *fanin_entries = static_cast<PTO2FaninSpillEntry *>(arena.region_ptr(layout.off_fanin_pool[r]));
-        memset(fanin_entries, 0, fanin_pool_bytes);
-        orch->rings[r].fanin_pool.init(fanin_entries, layout.dep_pool_capacity, orch_err);
+        // fanin_pool lives in PTO2SharedMemoryRingHeader (SM ring header).
+        // sm_dev_base is a device pointer that host cannot dereference, so
+        // initialization happens on AICPU side after sm_handle->init —
+        // see init_sm_fanin_pools() and its caller in aicpu_executor.cpp.
     }
 
     if (!orch->tensor_map.init_data_from_layout(layout.tensor_map, arena)) {
@@ -259,9 +255,8 @@ void PTO2OrchestratorState::wire_arena_pointers(
     const PTO2OrchestratorLayout &layout, DeviceArena &arena, PTO2SchedulerState *scheduler_arg
 ) {
     auto *orch = this;
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        orch->rings[r].fanin_pool.base = static_cast<PTO2FaninSpillEntry *>(arena.region_ptr(layout.off_fanin_pool[r]));
-    }
+    // fanin_pool.base is set on AICPU side (init_sm_fanin_pools); host cannot
+    // dereference sm_header so this loop is intentionally absent here.
     orch->tensor_map.wire_arena_pointers(layout.tensor_map, arena);
     orch->scope_tasks = static_cast<PTO2TaskSlotState **>(arena.region_ptr(layout.off_scope_tasks));
     orch->scope_begins = static_cast<int32_t *>(arena.region_ptr(layout.off_scope_begins));
@@ -275,9 +270,8 @@ void PTO2OrchestratorState::wire_arena_pointers(
 void PTO2OrchestratorState::destroy() {
     auto *orch = this;
     orch->tensor_map.destroy();
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        orch->rings[r].fanin_pool.base = nullptr;
-    }
+    // fanin_pool.base lives in SM; cleared on AICPU side at next boot via
+    // init_sm_fanin_pools.
     orch->scope_tasks = nullptr;
     orch->scope_begins = nullptr;
 }

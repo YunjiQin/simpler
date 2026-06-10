@@ -16,6 +16,7 @@
 #include "common/l2_perf_profiling.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
+#include "pto_orchestrator.h"
 #include "pto_runtime2.h"
 #include "runtime.h"
 #include "spin_hint.h"
@@ -150,12 +151,14 @@ void SchedulerContext::complete_slot_task(
         } else {
             LOG_INFO_V9("Thread %d: release", thread_idx);
             while (deferred_release_count > 0) {
+                PTO2TaskSlotState *rel = deferred_release_slot_states[--deferred_release_count];
+                PTO2FaninPool &spill_pool = sched_->orchestrator->sm_header->rings[rel->ring_id].fanin_pool;
 #if PTO2_SCHED_PROFILING
                 // SCHED_PROFILING variant takes thread_idx for the per-thread
                 // atomic counter side-effects. The return value is unused.
-                (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
+                (void)sched_->on_task_release(*rel, spill_pool, thread_idx);
 #else
-                sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
+                sched_->on_task_release(*rel, spill_pool);
 #endif
             }
             deferred_release_slot_states[deferred_release_count++] = &slot_state;

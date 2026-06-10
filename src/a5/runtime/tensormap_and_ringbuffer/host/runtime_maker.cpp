@@ -280,7 +280,6 @@ extern "C" int bind_prepared_to_runtime_impl(
     // free is deferred to DeviceRunner::finalize(). The runtime-arena size is
     // determined by replaying the reserve sequence on a host-side arena.
     uint64_t total_heap_size = eff_heap_size * PTO2_MAX_RING_DEPTH;
-    uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(eff_task_window_size);
     // dep_pool_size comes from a uint64 env var; reject values that don't fit
     // the int32_t layout-sizing path rather than silently truncating.
     int32_t eff_dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE;
@@ -291,6 +290,7 @@ extern "C" int bind_prepared_to_runtime_impl(
         }
         eff_dep_pool_capacity = static_cast<int32_t>(runtime->dep_pool_size);
     }
+    uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(eff_task_window_size, eff_dep_pool_capacity);
 
     int64_t t_prebuilt_start = _now_ms();
     DeviceArena host_arena;  // libc malloc backend by default

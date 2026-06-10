@@ -245,9 +245,10 @@ struct PTO2TaskPayload {
     int32_t scalar_count{0};
     int32_t fanin_actual_count{0};  // Actual fanin count (without the +1 redundance)
     int32_t fanin_spill_start{0};   // Linear start index in fanin spill pool (0 = no spill)
-    PTO2FaninPool *fanin_spill_pool{nullptr};
+    // Spill pool is per-ring (orch->rings[ring_id].fanin_pool); derive from
+    // slot_state->ring_id instead of caching a per-payload pointer.
     PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP];
-    // 40B implicit pad to the cache-line-aligned tensors[] region. Tag/scope
+    // 48B implicit pad to the cache-line-aligned tensors[] region. Tag/scope
     // metadata that wiring needs lives on PTO2WiringEvent (see pto_scheduler.h)
     // rather than here — those are event-time inputs, not durable task state.
     // === Cache lines 9-40 (2048B) — tensors (alignas(64) forces alignment) ===
@@ -294,9 +295,8 @@ struct PTO2TaskPayload {
 };
 
 // PTO2TaskPayload layout verification (offsetof requires complete type).
-static_assert(offsetof(PTO2TaskPayload, fanin_spill_pool) == 16, "spill pool pointer layout drift");
 static_assert(
-    offsetof(PTO2TaskPayload, fanin_inline_slot_states) == 24, "inline fanin array must follow spill metadata"
+    offsetof(PTO2TaskPayload, fanin_inline_slot_states) == 16, "inline fanin array must follow fanin counters"
 );
 static_assert(offsetof(PTO2TaskPayload, tensors) == 576, "tensors must start at byte 576 (cache line 9)");
 static_assert(

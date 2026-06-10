@@ -21,6 +21,7 @@
 #include "common/l2_perf_profiling.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
+#include "pto_orchestrator.h"
 #include "pto_runtime2.h"
 #include "runtime.h"
 #include "spin_hint.h"
@@ -749,12 +750,12 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 deferred_release_slot_states[deferred_release_count++] = &dummy_slot;
                 if (deferred_release_count >= PTO2_DEFERRED_RELEASE_CAP) {
                     while (deferred_release_count > 0) {
+                        PTO2TaskSlotState *rel = deferred_release_slot_states[--deferred_release_count];
+                        PTO2FaninPool &spill_pool = sched_->orchestrator->sm_header->rings[rel->ring_id].fanin_pool;
 #if PTO2_SCHED_PROFILING
-                        (void)sched_->on_task_release(
-                            *deferred_release_slot_states[--deferred_release_count], thread_idx
-                        );
+                        (void)sched_->on_task_release(*rel, spill_pool, thread_idx);
 #else
-                        sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
+                        sched_->on_task_release(*rel, spill_pool);
 #endif
                     }
                 }
@@ -874,10 +875,12 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             idle_iterations = 0;
         } else {
             while (deferred_release_count > 0) {
+                PTO2TaskSlotState *rel = deferred_release_slot_states[--deferred_release_count];
+                PTO2FaninPool &spill_pool = sched_->orchestrator->sm_header->rings[rel->ring_id].fanin_pool;
 #if PTO2_SCHED_PROFILING
-                (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
+                (void)sched_->on_task_release(*rel, spill_pool, thread_idx);
 #else
-                sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
+                sched_->on_task_release(*rel, spill_pool);
 #endif
             }
             idle_iterations++;
@@ -919,10 +922,12 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // here so every consumed producer slot completes its on_task_release
     // regardless of which loop-exit path fired.
     while (deferred_release_count > 0) {
+        PTO2TaskSlotState *rel = deferred_release_slot_states[--deferred_release_count];
+        PTO2FaninPool &spill_pool = sched_->orchestrator->sm_header->rings[rel->ring_id].fanin_pool;
 #if PTO2_SCHED_PROFILING
-        (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
+        (void)sched_->on_task_release(*rel, spill_pool, thread_idx);
 #else
-        sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
+        sched_->on_task_release(*rel, spill_pool);
 #endif
     }
 

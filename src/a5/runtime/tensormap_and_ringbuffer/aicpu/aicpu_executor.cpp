@@ -525,14 +525,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 static_cast<uint64_t>(task_window_size), static_cast<uint64_t>(heap_size), dep_pool_capacity
             );
 
-            // gm_heap pointer / dep_pool_capacity are encoded into the prebuilt
-            // runtime arena image at host build time, so we no longer fetch
-            // them here. They remain on the host Runtime instance and on the
-            // PTO2Runtime header for diagnostic purposes only.
-            (void)dep_pool_capacity;
-
+            // gm_heap pointer is encoded into the prebuilt runtime arena image
+            // at host build time, so we no longer fetch it here. dep_pool_capacity
+            // now feeds SM sizing (fanin spill entries are SM-resident).
             void *sm_ptr = runtime->get_gm_sm_ptr();
-            uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(task_window_size);
+            uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(task_window_size, dep_pool_capacity);
 
             // Prebuilt-arena fast path. Host has pre-populated the entire
             // runtime arena (PTO2Runtime + orchestrator/scheduler/tensor_map
@@ -561,7 +558,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // fanin_count/active_mask zero — previously done inside
             // RingSchedState::init).
             memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
-            if (!rt->sm_handle->init(sm_ptr, sm_size, task_window_size, heap_size)) {
+            if (!rt->sm_handle->init(sm_ptr, sm_size, task_window_size, heap_size, dep_pool_capacity)) {
                 LOG_ERROR("Thread %d: sm_handle->init failed", thread_idx);
                 runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;

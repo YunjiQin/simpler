@@ -39,6 +39,7 @@
 #pragma once
 
 #include "device_arena.h"
+#include "pto_fanin_pool.h"
 #include "pto_runtime2_types.h"
 
 // =============================================================================
@@ -94,6 +95,12 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     PTO2TaskDescriptor *task_descriptors;
     PTO2TaskPayload *task_payloads;
     PTO2TaskSlotState *slot_states;
+
+    // Fanin spill pool — per-ring shared resource (orch writes, wiring/sched read).
+    // Embedded here so sched/wire access lands on the same per-ring cache lines they
+    // already touch for slot_states / task_descriptors, instead of a separate orch
+    // struct line.
+    PTO2FaninPool fanin_pool;
 
     PTO2TaskDescriptor &get_task_by_slot(int32_t slot) { return task_descriptors[slot]; }
 
@@ -165,8 +172,9 @@ struct PTO2SharedMemoryHandle {
 
     // === Static helpers ===
 
-    static uint64_t calculate_size(uint64_t task_window_size);
-    static uint64_t calculate_size_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]);
+    static uint64_t calculate_size(uint64_t task_window_size, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
+    static uint64_t
+    calculate_size_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], int32_t dep_pool_capacity);
 
     // UT convenience: reserve wrapper + sm_base on `arena`, commit, and init
     // using default PTO2_TASK_WINDOW_SIZE / PTO2_HEAP_SIZE. Only valid when the
@@ -179,20 +187,26 @@ struct PTO2SharedMemoryHandle {
     // In-place init for caller-provided wrapper storage (e.g. a region carved
     // out of a DeviceArena). Sets is_owner = false, calls setup_pointers and
     // init_header. Returns false when `sm_size` is too small for the requested
-    // `task_window_size`.
-    bool init(void *sm_base, uint64_t sm_size, uint64_t task_window_size, uint64_t heap_size);
+    // `task_window_size` + `dep_pool_capacity`.
+    bool init(
+        void *sm_base, uint64_t sm_size, uint64_t task_window_size, uint64_t heap_size,
+        int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
+    );
 
     void destroy();
     void print_layout();
     bool validate();
 
 private:
-    void init_header(uint64_t task_window_size, uint64_t heap_size);
+    void init_header(uint64_t task_window_size, uint64_t heap_size, int32_t dep_pool_capacity);
     void init_header_per_ring(
-        const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
+        const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH],
+        int32_t dep_pool_capacity
     );
-    void setup_pointers(uint64_t task_window_size);
-    void setup_pointers_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]);
+    void setup_pointers(uint64_t task_window_size, int32_t dep_pool_capacity);
+    void setup_pointers_per_ring(
+        const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], int32_t dep_pool_capacity
+    );
 };
 
 // =============================================================================

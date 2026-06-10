@@ -27,25 +27,31 @@
 // Size Calculation
 // =============================================================================
 
-uint64_t PTO2SharedMemoryHandle::calculate_size(uint64_t task_window_size) {
+uint64_t PTO2SharedMemoryHandle::calculate_size(uint64_t task_window_size, int32_t dep_pool_capacity) {
     uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH];
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         task_window_sizes[r] = task_window_size;
     }
-    return calculate_size_per_ring(task_window_sizes);
+    return calculate_size_per_ring(task_window_sizes, dep_pool_capacity);
 }
 
-uint64_t PTO2SharedMemoryHandle::calculate_size_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]) {
+uint64_t PTO2SharedMemoryHandle::calculate_size_per_ring(
+    const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], int32_t dep_pool_capacity
+) {
     uint64_t size = 0;
 
     // Header (aligned to cache line)
     size += PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
 
-    // Per-ring task descriptors and payloads
+    const uint64_t fanin_entries_bytes =
+        PTO2_ALIGN_UP(static_cast<uint64_t>(dep_pool_capacity) * sizeof(PTO2FaninSpillEntry), PTO2_ALIGN_SIZE);
+
+    // Per-ring task descriptors, payloads, slot states, and fanin spill entries
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         size += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
         size += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
         size += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
+        size += fanin_entries_bytes;
     }
 
     return size;
@@ -55,14 +61,19 @@ uint64_t PTO2SharedMemoryHandle::calculate_size_per_ring(const uint64_t task_win
 // Creation and Destruction
 // =============================================================================
 
-void PTO2SharedMemoryHandle::setup_pointers_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]) {
+void PTO2SharedMemoryHandle::setup_pointers_per_ring(
+    const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], int32_t dep_pool_capacity
+) {
     char *ptr = (char *)sm_base;
 
     // Header
     header = (PTO2SharedMemoryHeader *)ptr;
     ptr += PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
 
-    // Per-ring task descriptors, payloads, and slot states
+    const uint64_t fanin_entries_bytes =
+        PTO2_ALIGN_UP(static_cast<uint64_t>(dep_pool_capacity) * sizeof(PTO2FaninSpillEntry), PTO2_ALIGN_SIZE);
+
+    // Per-ring: task descriptors, payloads, slot states, fanin spill entries
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         auto &ring = header->rings[r];
         ring.task_descriptors = (PTO2TaskDescriptor *)ptr;
@@ -73,33 +84,38 @@ void PTO2SharedMemoryHandle::setup_pointers_per_ring(const uint64_t task_window_
 
         ring.slot_states = (PTO2TaskSlotState *)ptr;
         ptr += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
+
+        // fanin_pool.base points at the SM-resident spill ring buffer. Capacity
+        // and mutable fields (top/tail/...) are set by init_header_per_ring.
+        ring.fanin_pool.base = (PTO2FaninSpillEntry *)ptr;
+        ptr += fanin_entries_bytes;
     }
 }
 
-void PTO2SharedMemoryHandle::setup_pointers(uint64_t task_window_size) {
+void PTO2SharedMemoryHandle::setup_pointers(uint64_t task_window_size, int32_t dep_pool_capacity) {
     uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH];
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         task_window_sizes[r] = task_window_size;
     }
-    setup_pointers_per_ring(task_window_sizes);
+    setup_pointers_per_ring(task_window_sizes, dep_pool_capacity);
 }
 
 bool PTO2SharedMemoryHandle::init(
-    void *sm_base_arg, uint64_t sm_size_arg, uint64_t task_window_size, uint64_t heap_size
+    void *sm_base_arg, uint64_t sm_size_arg, uint64_t task_window_size, uint64_t heap_size, int32_t dep_pool_capacity
 ) {
     if (!sm_base_arg || sm_size_arg == 0) return false;
-    if (sm_size_arg < calculate_size(task_window_size)) return false;
+    if (sm_size_arg < calculate_size(task_window_size, dep_pool_capacity)) return false;
 
     sm_base = sm_base_arg;
     sm_size = sm_size_arg;
     is_owner = false;
-    setup_pointers(task_window_size);
-    init_header(task_window_size, heap_size);
+    setup_pointers(task_window_size, dep_pool_capacity);
+    init_header(task_window_size, heap_size, dep_pool_capacity);
     return true;
 }
 
 PTO2SharedMemoryHandle *PTO2SharedMemoryHandle::create_and_init_default(DeviceArena &arena) {
-    const uint64_t buffer_size = calculate_size(PTO2_TASK_WINDOW_SIZE);
+    const uint64_t buffer_size = calculate_size(PTO2_TASK_WINDOW_SIZE, PTO2_DEP_LIST_POOL_SIZE);
     const size_t off_handle = arena.reserve(sizeof(PTO2SharedMemoryHandle), alignof(PTO2SharedMemoryHandle));
     const size_t off_buffer = arena.reserve(static_cast<size_t>(buffer_size), PTO2_ALIGN_SIZE);
     if (arena.commit() == nullptr) return nullptr;
@@ -108,7 +124,9 @@ PTO2SharedMemoryHandle *PTO2SharedMemoryHandle::create_and_init_default(DeviceAr
     memset(handle, 0, sizeof(*handle));
     void *buffer = arena.region_ptr(off_buffer);
     memset(buffer, 0, static_cast<size_t>(buffer_size));
-    if (!handle->init(buffer, buffer_size, PTO2_TASK_WINDOW_SIZE, PTO2_HEAP_SIZE)) return nullptr;
+    if (!handle->init(buffer, buffer_size, PTO2_TASK_WINDOW_SIZE, PTO2_HEAP_SIZE, PTO2_DEP_LIST_POOL_SIZE)) {
+        return nullptr;
+    }
     return handle;
 }
 
@@ -126,18 +144,19 @@ void PTO2SharedMemoryHandle::destroy() {
 // =============================================================================
 //
 // no need init data in pool, init pool data when used
-void PTO2SharedMemoryHandle::init_header(uint64_t task_window_size, uint64_t heap_size) {
+void PTO2SharedMemoryHandle::init_header(uint64_t task_window_size, uint64_t heap_size, int32_t dep_pool_capacity) {
     uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH];
     uint64_t heap_sizes[PTO2_MAX_RING_DEPTH];
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         task_window_sizes[r] = task_window_size;
         heap_sizes[r] = heap_size;
     }
-    init_header_per_ring(task_window_sizes, heap_sizes);
+    init_header_per_ring(task_window_sizes, heap_sizes, dep_pool_capacity);
 }
 
 void PTO2SharedMemoryHandle::init_header_per_ring(
-    const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
+    const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH],
+    int32_t dep_pool_capacity
 ) {
     // Per-ring flow control (start at 0)
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
@@ -175,6 +194,11 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     // bind_ring() pins the ring_id (slot-invariant after this point);
     // reset_for_reuse() prepares dynamic fanout/refcount fields so the first
     // submit doesn't need an explicit reset.
+    // Per-ring fanin_pool reset. setup_pointers_per_ring already pointed
+    // ring.fanin_pool.base at the SM-resident spill ring buffer; here we set
+    // capacity / top=1 / tail=1 / clear stats / sentinel slot[0]. error_code_ptr
+    // is wired to the SM orch_error_code so overflow reports land in SM where
+    // host can read them.
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         auto &ring = header->rings[r];
         for (uint64_t i = 0; i < task_window_sizes[r]; i++) {
@@ -183,6 +207,15 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
             ring.slot_states[i].fanin_count = 0;
             ring.slot_states[i].active_mask = ActiveMask{};
         }
+        auto *base = ring.fanin_pool.base;
+        memset(base, 0, static_cast<size_t>(dep_pool_capacity) * sizeof(PTO2FaninSpillEntry));
+        ring.fanin_pool.capacity = dep_pool_capacity;
+        ring.fanin_pool.top = 1;
+        ring.fanin_pool.tail = 1;
+        ring.fanin_pool.high_water = 0;
+        ring.fanin_pool.reclaim_task_cursor = 0;
+        ring.fanin_pool.error_code_ptr = &header->orch_error_code;
+        // base[0] left as the unused sentinel (slot_state == nullptr from memset).
     }
 }
 

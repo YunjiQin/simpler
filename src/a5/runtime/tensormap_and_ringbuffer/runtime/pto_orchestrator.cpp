@@ -520,13 +520,11 @@ static TaskOutputTensors submit_task_common(
     payload.init(args, result, prepared.alloc_result, layout);
     CYCLE_COUNT_LAP(g_orch_payload_init_cycle);
 
-    payload.fanin_spill_pool = &orch->rings[ring_id].fanin_pool;
-
     // === STEP 3: resolve explicit_deps NOW (orch reads last_task_alive at
     // submit time; deferring to wiring would race against ring advance) and
     // drop the prefix straight into payload.fanin_inline_slot_states[]. wiring
     // will continue extending in compute_task_fanin's emit. ===
-    PTO2FaninBuilder fanin_builder(payload.fanin_inline_slot_states, orch->rings[ring_id].fanin_pool);
+    PTO2FaninBuilder fanin_builder(payload.fanin_inline_slot_states, orch->sm_header->rings[ring_id].fanin_pool);
     std::atomic<int32_t> *orch_err = &orch->sm_header->orch_error_code;
     for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
         PTO2TaskId dep_task_id = args.explicit_dep(i);
@@ -740,11 +738,13 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const Arg &args) {
     TaskOutputTensors outputs;
     outputs.set_task_id(prepared.task_id);
     payload.init(args, outputs, prepared.alloc_result, layout);
+
+    // Reset fanin so PTO2FaninPool::reclaim sees a clean count even though
+    // this slot's previous user may have had >FANIN_INLINE_CAP producers.
+    // reset_for_reuse only resets slot_state; payload fields retain stale values.
     payload.fanin_actual_count = 0;
     payload.fanin_spill_start = 0;
-    payload.fanin_spill_pool = &orch->rings[prepared.task_id.ring()].fanin_pool;
     CYCLE_COUNT_LAP_RECORD(g_orch_args_cycle, AicpuPhaseId::ORCH_PARAMS, prepared.task_id.raw);
-
     if (prepared.slot_state != nullptr) {
         // Hidden alloc tasks complete inline in the orchestrator before any
         // consumer can exist, so they have no fanout to notify and no worker
@@ -782,7 +782,7 @@ void PTO2OrchestratorState::mark_done() {
         if (total_tasks > 0) {
             LOG_INFO_V0("=== [Orchestrator] ring %d: total_tasks=%d ===", r, total_tasks);
         }
-        auto &fanin_pool = orch->rings[r].fanin_pool;
+        auto &fanin_pool = orch->sm_header->rings[r].fanin_pool;
         if (fanin_pool.top > 1) {
             LOG_INFO_V0(
                 "=== [FaninPool %d] top=%d tail=%d used=%d high_water=%d capacity=%d ===", r, fanin_pool.top,

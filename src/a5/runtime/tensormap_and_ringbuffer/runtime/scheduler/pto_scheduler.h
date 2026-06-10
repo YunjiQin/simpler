@@ -1135,7 +1135,7 @@ struct PTO2SchedulerState {
      */
 
 #if PTO2_SCHED_PROFILING
-    int32_t on_task_release(PTO2TaskSlotState &slot_state, int32_t thread_idx) {
+    int32_t on_task_release(PTO2TaskSlotState &slot_state, PTO2FaninPool &spill_pool, int32_t thread_idx) {
         PTO2_SCHED_CYCLE_START();
         extern uint64_t g_sched_fanin_cycle[], g_sched_fanin_atomic_count[];
         extern uint64_t g_sched_self_atomic_count[];
@@ -1143,10 +1143,10 @@ struct PTO2SchedulerState {
         extern uint64_t g_sched_complete_count[];
         uint64_t fanin_atomics = 0;
 #else
-    int32_t on_task_release(PTO2TaskSlotState &slot_state) {
+    int32_t on_task_release(PTO2TaskSlotState &slot_state, PTO2FaninPool &spill_pool) {
 #endif
         PTO2TaskPayload *payload = slot_state.payload;
-        for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer_slot_state) {
+        for_each_fanin_slot_state(*payload, spill_pool, [&](PTO2TaskSlotState *producer_slot_state) {
 #if PTO2_SCHED_PROFILING
             release_producer(*producer_slot_state, fanin_atomics);
 #else

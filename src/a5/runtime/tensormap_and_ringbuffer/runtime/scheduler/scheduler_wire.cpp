@@ -155,7 +155,7 @@ void PTO2SchedulerState::wire_task(RingSchedState &rss, const PTO2WiringEvent &e
 
     PTO2OrchestratorState *orch = orchestrator;
     PTO2TensorMap &tensor_map = orch->tensor_map;
-    PTO2FaninPool &spill_pool = *wp->fanin_spill_pool;
+    PTO2FaninPool &spill_pool = orch->sm_header->rings[ring_id].fanin_pool;
 
     // sync_tensormap is now called once per drain batch (see drain_wiring_queue),
     // not per task — last_task_alive is stable within a drain.
@@ -181,6 +181,8 @@ void PTO2SchedulerState::wire_task(RingSchedState &rss, const PTO2WiringEvent &e
     // 3. Re-attach the fanin builder onto payload's inline_slots buffer; the
     // orch-side explicit_dep loop left a prefix of `fanin_actual_count` slots
     // already populated. compute_task_fanin's emit lambda extends it.
+    wp->fanin_actual_count = 0;
+    wp->fanin_spill_start = 0;
     PTO2FaninBuilder builder(wp->fanin_inline_slot_states, spill_pool);
     builder.count = wp->fanin_actual_count;
     builder.spill_start = wp->fanin_spill_start;
