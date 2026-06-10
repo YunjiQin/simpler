@@ -558,6 +558,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     }
 
     LOG_INFO_V0("Thread %d: PTO2 dispatch starting with %d cores", thread_idx, tracker.core_num());
+
     int32_t cur_thread_completed = 0;
     int32_t idle_iterations = 0;
     int32_t last_progress_count = 0;
@@ -580,6 +581,19 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
 #if PTO2_PROFILING
     l2_perf.sched_start_ts = get_sys_cnt_aicpu();
+#endif
+
+#if PTO2_PAUSE_SCHED_UNTIL_ORCH_DONE
+    // Experiment: hold sched until orchestrator_done_ so orch_cost reflects
+    // its uncontended floor. Gate sits AFTER sched_start_ts so the wait does
+    // NOT inflate sched_cost — sched is technically "started" already, it's
+    // just not doing any dispatch work. AICore cores stay idle until the
+    // gate releases.
+    LOG_INFO_V0("Thread %d: sched paused until orchestrator_done", thread_idx);
+    while (!orchestrator_done_) {
+        SPIN_WAIT_HINT();
+    }
+    LOG_INFO_V0("Thread %d: sched resumed", thread_idx);
 #endif
 
     while (true) {

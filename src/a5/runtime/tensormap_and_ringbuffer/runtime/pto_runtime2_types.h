@@ -59,7 +59,7 @@
 #endif
 
 #ifndef PTO2_ORCH_PROFILING
-#define PTO2_ORCH_PROFILING 0
+#define PTO2_ORCH_PROFILING 1
 #endif
 
 #ifndef PTO2_SCHED_PROFILING
@@ -123,7 +123,22 @@
 #define PTO2_READY_QUEUE_SIZE 65536  // Per-shape queue size
 
 // Wiring queue
-#define PTO2_WRIRING_QUEUE_SIZE 1024  // Per-shape queue size
+// Sized to comfortably hold the largest single-scope submit burst on this
+// example (paged_attention_unroll Case1 = 1280 pushes). 1024 wasn't enough
+// when running the "pause wiring until orch_done" experiment that measures
+// orch-only floor — push spin-wait dominated.
+#define PTO2_WRIRING_QUEUE_SIZE 2048  // Per-shape queue size
+
+// Experiment toggles: when set to 1, the corresponding sched-side thread
+// spin-waits on orchestrator_done_ before entering its main loop. Used to
+// measure orch_cost in isolation (PAUSE_WIRING=1, PAUSE_SCHED=1) and with
+// only wiring running (PAUSE_WIRING=0, PAUSE_SCHED=1). Both default to 0.
+#ifndef PTO2_PAUSE_WIRING_UNTIL_ORCH_DONE
+#define PTO2_PAUSE_WIRING_UNTIL_ORCH_DONE 0
+#endif
+#ifndef PTO2_PAUSE_SCHED_UNTIL_ORCH_DONE
+#define PTO2_PAUSE_SCHED_UNTIL_ORCH_DONE 0
+#endif
 
 // Fanin storage
 #define PTO2_FANIN_INLINE_CAP 64

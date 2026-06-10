@@ -1039,6 +1039,18 @@ void SchedulerContext::wiring_thread_run(Runtime *runtime, int32_t thread_idx) {
     (void)runtime;
     LOG_INFO_V0("Thread %d: wiring_thread_run start", thread_idx);
 
+#if PTO2_PAUSE_WIRING_UNTIL_ORCH_DONE
+    // Experiment: hold wiring until orchestrator_done_ so orch_cost reflects
+    // its uncontended floor (no wiring drain happening in parallel). After
+    // orch_done, fall through to the normal drain loop — it will clear the
+    // backlog and exit cleanly via completed_.
+    LOG_INFO_V0("Thread %d: wiring paused until orchestrator_done", thread_idx);
+    while (!orchestrator_done_) {
+        SPIN_WAIT_HINT();
+    }
+    LOG_INFO_V0("Thread %d: wiring resumed", thread_idx);
+#endif
+
     while (!completed_.load(std::memory_order_acquire)) {
         // 1. Drain orch wiring queue (force-drain after orch_done so any
         //    last-second submissions don't stall).
