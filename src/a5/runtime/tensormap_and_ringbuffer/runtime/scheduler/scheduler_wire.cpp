@@ -180,10 +180,10 @@ void PTO2SchedulerState::wire_task(RingSchedState &rss, const PTO2WiringEvent &e
 
     // 3. Re-attach the fanin builder onto payload's inline_slots buffer; the
     // orch-side explicit_dep loop left a prefix of `fanin_actual_count` slots
-    // already populated. compute_task_fanin's emit lambda extends it.
-    wp->fanin_actual_count = 0;
-    wp->fanin_spill_start = 0;
-    PTO2FaninBuilder builder(wp->fanin_inline_slot_states, spill_pool);
+    // already populated. compute_task_fanin's emit lambda extends it from
+    // there. (Previously this zeroed wp->fanin_actual_count first and lost
+    // any orch-side manual deps — preserved here.)
+    PTO2FaninBuilder builder(wp->fanin_inline_slot_states);
     builder.count = wp->fanin_actual_count;
     builder.spill_start = wp->fanin_spill_start;
     WIRE_CYCLE_LAP(perf.blob_cycle);
@@ -221,7 +221,7 @@ void PTO2SchedulerState::wire_task(RingSchedState &rss, const PTO2WiringEvent &e
 
     if (wfanin != 0) {
         int32_t early_finished = 0;
-        builder.for_each([&](PTO2TaskSlotState *producer) {
+        builder.for_each(spill_pool, [&](PTO2TaskSlotState *producer) {
             producer->lock_fanout();
             int32_t pstate = producer->task_state.load(std::memory_order_acquire);
             if (pstate >= PTO2_TASK_COMPLETED) {

@@ -183,6 +183,13 @@ public:
     int32_t task_tail() const { return last_alive_ptr_->load(std::memory_order_acquire); }
     int32_t task_head() const { return local_task_id_; }
 
+    /// Slot index the NEXT alloc() call will return (single-writer orch, so
+    /// this prediction is stable while the orch holds the allocator). Used by
+    /// submit_task_common to pre-warm the next task's payload cache lines at
+    /// the END of the current submit — earliest possible point we can issue
+    /// prefetch without racing alloc.
+    int32_t peek_next_slot() const { return local_task_id_ & window_mask_; }
+
     int32_t window_size() const { return window_size_; }
 
     uint64_t heap_available() const {

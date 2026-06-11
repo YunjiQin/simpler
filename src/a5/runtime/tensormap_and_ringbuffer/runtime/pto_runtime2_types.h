@@ -59,7 +59,7 @@
 #endif
 
 #ifndef PTO2_ORCH_PROFILING
-#define PTO2_ORCH_PROFILING 1
+#define PTO2_ORCH_PROFILING 0
 #endif
 
 #ifndef PTO2_SCHED_PROFILING
@@ -188,9 +188,15 @@ struct PTO2TaskAllocResult {
     bool failed() const { return task_id < 0; }
 };
 
+// offsets[] / buffer_sizes[] are only read by payload.init_tensors for slots
+// where args.tag(i) == OUTPUT — calculate_output_layout writes those slots
+// before any read, so the unused slots stay uninitialized on purpose. The
+// 256B default zero-init was ~21ns/task of pure store-buffer pressure for
+// no reader; total_output_size still needs the = 0 so calculate_output_layout
+// can accumulate into it.
 struct PTO2OutputLayout {
-    uint64_t offsets[MAX_TENSOR_ARGS] = {};
-    uint64_t buffer_sizes[MAX_TENSOR_ARGS] = {};
+    uint64_t offsets[MAX_TENSOR_ARGS];
+    uint64_t buffer_sizes[MAX_TENSOR_ARGS];
     int32_t total_output_size = 0;
 };
 
@@ -285,11 +291,15 @@ struct PTO2TaskPayload {
      * @param args                Task arguments (tensors + scalars)
      * @param result  Materialized output tensors (from TensorCreateInfo path)
      */
-    void init(const Arg &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout) {
+    __attribute__((always_inline)) void
+    init(const Arg &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout) {
+        // tensor_count + scalar_count are adjacent at payload offset 0/4
+        // (CL0). Writing them together here (vs. separating scalar_count into
+        // a scalar-only pass) lets the compiler emit a single STP-pair store
+        // for both counters and avoids a second CL0 dirty when the scalar
+        // memcpy runs over CL41+.
         tensor_count = args.tensor_count();
         scalar_count = args.scalar_count();
-
-        // int32_t out_idx = 0;
         for (int32_t i = 0; i < args.tensor_count(); i++) {
             if (args.tag(i) != TensorArgType::OUTPUT) {
                 tensors[i].copy(*args.tensor(i).ptr);

@@ -63,12 +63,32 @@ private:
 #endif
 
 /**
+ * Branch-prediction hints. Used on hot paths where the typical case is
+ * very far from 50/50 (validation/assert failures, cache-full retries,
+ * etc.) so the compiler keeps the fall-through tight and moves the cold
+ * handler off-line. Falls back to no-op on non-GCC/Clang compilers.
+ */
+#if defined(__GNUC__) || defined(__clang__)
+#define LIKELY(x)   (__builtin_expect(!!(x), 1))
+#define UNLIKELY(x) (__builtin_expect(!!(x), 0))
+#else
+#define LIKELY(x)   (x)
+#define UNLIKELY(x) (x)
+#endif
+
+/**
  * always_assert macro:
  * checks the condition in both debug and release builds.
+ *
+ * UNLIKELY tells the compiler the failure branch is cold so it can lay
+ * the assert_impl call out of the hot fall-through path. Used on every
+ * submit_task entry; without the hint the orch hot loop was paying
+ * branch-prediction penalty + extra I-cache for the assert handler
+ * inline-adjacent to the hot path.
  */
 #define always_assert(cond)                         \
     do {                                            \
-        if (!(cond)) {                              \
+        if (UNLIKELY(!(cond))) {                    \
             assert_impl(#cond, __FILE__, __LINE__); \
         }                                           \
     } while (0)

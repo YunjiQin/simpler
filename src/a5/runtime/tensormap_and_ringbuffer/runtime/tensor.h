@@ -256,7 +256,7 @@ struct alignas(64) Tensor {
     /// derivable from line 1, so we **skip reading other's cache line 2** and
     /// write dst's line 2 from the local shapes instead. Non-contiguous source
     /// pays one line 2 read; contiguous source does not.
-    void init_from(const Tensor &other) {
+    __attribute__((always_inline)) void init_from(const Tensor &other) {
         init_from_line1(other);
         if (other.is_contiguous && other.start_offset == 0) {
             // Derive line 2 from line 1: stride = row-major of shapes; extent = numel.
@@ -281,17 +281,17 @@ struct alignas(64) Tensor {
     /// in place and calls `refresh_derived()` to recompute line 2 once. This
     /// avoids the wasted line 2 writes that `init_from()` would do just before
     /// the op overwrites them.
-    void init_from_line1(const Tensor &other) { memcpy(this, &other, 64); }
+    __attribute__((always_inline)) void init_from_line1(const Tensor &other) { memcpy(this, &other, 64); }
 
     /// Backward-compat alias used by orchestrator hot paths that need a full
     /// deep copy. Equivalent to `init_from(other)`.
-    void copy(const Tensor &other) { init_from(other); }
+    __attribute__((always_inline)) void copy(const Tensor &other) { init_from(other); }
 
     /// Materialize a TensorCreateInfo into this Tensor (fresh contiguous output).
     /// Single 64B memcpy covers cache line 1; ci pre-initialises start_offset (=0)
     /// and is_contiguous (=true) in its line-1 slots so they need no reset here.
     /// Cache line 2 (stride/extent) is computed from `ci.shapes` in a single reverse pass.
-    void init_from_create_info(const TensorCreateInfo &ci, void *addr, uint64_t buffer_size) {
+    __attribute__((always_inline)) void init_from_create_info(const TensorCreateInfo &ci, void *addr, uint64_t buffer_size) {
         always_assert(ci.ndims > 0 && ci.ndims <= RUNTIME_MAX_TENSOR_DIMS);
         memcpy(this, &ci, 64);
         buffer = {reinterpret_cast<uint64_t>(addr), buffer_size};

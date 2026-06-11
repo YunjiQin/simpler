@@ -70,17 +70,13 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { retur
 // Also hidden to prevent HOST .so from polluting the global symbol table.
 __attribute__((weak, visibility("hidden"))) void
 l2_perf_aicpu_record_orch_phase(AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint64_t) {}
-// Accumulated cycles per sub-step (only needed for ORCH_PROFILING export)
-static uint64_t g_orch_sync_cycle = 0;            // tensormap sync
+// Accumulated cycles per sub-step (only needed for ORCH_PROFILING export).
+// sync_tensormap / lookup+dep / tensormap_ins counters were retired after the
+// wiring refactor moved those phases off the orch thread; the WIRING_PROFILING
+// equivalents in scheduler_wire.cpp report them now.
 static uint64_t g_orch_alloc_cycle = 0;           // unified task+heap alloc (outer LAP across all prepare_task)
-static uint64_t g_orch_alloc_alloc_cycle = 0;     // prepare_task: allocator.alloc() (task slot + heap)
-static uint64_t g_orch_alloc_prefetch_cycle = 0;  // prepare_task: prefetch_payload
-static uint64_t g_orch_alloc_bind_cycle = 0;      // prepare_task: bind_buffers + slot_state writes (excl. scope_push)
-static uint64_t g_orch_alloc_scope_push_cycle = 0;  // prepare_task: scope_tasks_push
 static uint64_t g_orch_payload_init_cycle = 0;    // descriptor write + payload.init() (Tensor::copy + scalars)
 static uint64_t g_orch_args_cycle = 0;            // wiring-blob snapshot + explicit_dep loop
-static uint64_t g_orch_lookup_cycle = 0;          // tensormap lookup + dep building
-static uint64_t g_orch_insert_cycle = 0;          // tensormap insert
 static uint64_t g_orch_fanin_cycle = 0;           // fanin list + early-return check
 static uint64_t g_orch_scope_end_cycle = 0;       // scope_end overhead
 static int64_t g_orch_submit_count = 0;
@@ -200,12 +196,17 @@ void PTO2OrchestratorState::report_fatal(int32_t error_code, const char *func, c
 
 static void scope_tasks_push(PTO2OrchestratorState *orch, PTO2TaskSlotState *task_slot_state);
 
+// prepare_task() unconditionally overwrites every field after allocator.alloc()
+// returns; the only consumer that runs BEFORE those writes is the failure-path
+// check `out->alloc_result.failed()`, and allocator.alloc() itself sets
+// alloc_result.task_id to a valid value or -1. Default-initializing 64B per
+// task on entry to prepare_task was ~5-8us of pure store-buffer churn.
 struct PTO2PreparedTask {
-    PTO2TaskId task_id = PTO2TaskId::invalid();
-    PTO2TaskAllocResult alloc_result = {-1, 0, nullptr, nullptr};
-    PTO2TaskDescriptor *task = nullptr;
-    PTO2TaskPayload *payload = nullptr;
-    PTO2TaskSlotState *slot_state = nullptr;
+    PTO2TaskId task_id;
+    PTO2TaskAllocResult alloc_result;
+    PTO2TaskDescriptor *task;
+    PTO2TaskPayload *payload;
+    PTO2TaskSlotState *slot_state;
 };
 
 static PTO2OutputLayout calculate_output_layout(const Arg &args) {
@@ -255,6 +256,38 @@ static bool check_scope_can_accept_task(PTO2OrchestratorState *orch, PTO2TaskAll
     return false;
 }
 
+// Pre-warm the next task's SM lines (payload meta + first ~3 tensor slots +
+// scalars[0] + slot_state + task descriptor) at the end of every submit /
+// alloc so the next iteration's writes find them in L1 instead of paying
+// 25-50 cycles of cold M-state fill each.
+//
+// Uses `peek_next_slot()` on the per-ring allocator — orch is single-writer
+// for this ring so the predicted slot is stable until the next prepare_task.
+__attribute__((always_inline)) static inline void prefetch_next_task_slot(
+    PTO2OrchestratorState *orch, uint8_t ring_id
+) {
+    auto &allocator_for_pf = orch->rings[ring_id].task_allocator;
+    int32_t next_slot = allocator_for_pf.peek_next_slot();
+    auto &next_ring = orch->sm_header->rings[ring_id];
+    auto &next_payload = next_ring.task_payloads[next_slot];
+    auto &next_slot_state = next_ring.slot_states[next_slot];
+    auto &next_task = next_ring.task_descriptors[next_slot];
+    __builtin_prefetch(&next_payload, 1, 3);
+    __builtin_prefetch(reinterpret_cast<char *>(&next_payload) + 64, 1, 3);
+    // Pre-warm 3 tensor lines (each is 2 CL); typical paged_attention task
+    // is 3-5 tensors. Lines past tensor_count are wasted prefetches but
+    // don't pollute anything else important.
+    __builtin_prefetch(&next_payload.tensors[0], 1, 3);
+    __builtin_prefetch(reinterpret_cast<char *>(&next_payload.tensors[0]) + 64, 1, 3);
+    __builtin_prefetch(&next_payload.tensors[1], 1, 3);
+    __builtin_prefetch(reinterpret_cast<char *>(&next_payload.tensors[1]) + 64, 1, 3);
+    __builtin_prefetch(&next_payload.tensors[2], 1, 3);
+    __builtin_prefetch(reinterpret_cast<char *>(&next_payload.tensors[2]) + 64, 1, 3);
+    __builtin_prefetch(&next_payload.scalars[0], 1, 3);
+    __builtin_prefetch(&next_slot_state, 1, 3);
+    __builtin_prefetch(&next_task, 1, 3);
+}
+
 static void prefetch_payload(PTO2TaskPayload *payload, int32_t tensor_count, int32_t scalar_count) {
     for (int32_t i = 0; i < tensor_count; i++) {
         __builtin_prefetch(&payload->tensors[i], 1, 3);
@@ -268,22 +301,20 @@ static void prefetch_payload(PTO2TaskPayload *payload, int32_t tensor_count, int
     __builtin_prefetch(reinterpret_cast<char *>(payload) + 128, 1, 3);
 }
 
+
 __attribute__((always_inline)) static inline bool prepare_task(
     PTO2OrchestratorState *orch, const Arg &args, int32_t total_output_size, ActiveMask active_mask,
     PTO2PreparedTask *out
 ) {
-#if PTO2_ORCH_PROFILING
-    uint64_t _pt_t0 = get_sys_cnt_aicpu();
-#endif
     uint8_t ring_id = orch->current_ring_id();
     auto &allocator = orch->rings[ring_id].task_allocator;
 
-    if (!check_scope_can_accept_task(orch, allocator, ring_id)) {
+    if (UNLIKELY(!check_scope_can_accept_task(orch, allocator, ring_id))) {
         return false;
     }
 
     out->alloc_result = allocator.alloc(total_output_size);
-    if (out->alloc_result.failed()) {
+    if (UNLIKELY(out->alloc_result.failed())) {
         orch_mark_fatal(orch, PTO2_ERROR_HEAP_RING_DEADLOCK);
         return false;
     }
@@ -292,27 +323,8 @@ __attribute__((always_inline)) static inline bool prepare_task(
     out->slot_state = &orch->sm_header->rings[ring_id].get_slot_state_by_slot(out->alloc_result.slot);
     out->task = &orch->sm_header->rings[ring_id].task_descriptors[out->alloc_result.slot];
     out->payload = &orch->sm_header->rings[ring_id].task_payloads[out->alloc_result.slot];
-#if PTO2_ORCH_PROFILING
-    uint64_t _pt_t1 = get_sys_cnt_aicpu();
-    g_orch_alloc_alloc_cycle += _pt_t1 - _pt_t0;
-#endif
-
-    // Write-prefetch slot_state. The slot was just allocated from a per-ring
-    // rotating window, so its lines are typically in another cluster or
-    // evicted. Kicking the M-state fill in parallel with prefetch_payload
-    // below (which targets a different cache line range entirely) lets the
-    // bind+state phase land in L1 by the time we reach it.
-    //
-    // sizeof(PTO2TaskSlotState) is 64B when SCHED_PROFILING is off (single
-    // hot cache line) and 128B when on (second line for fanin_zero / enter_gq
-    // lifecycle timestamps).
-    // __builtin_prefetch(reinterpret_cast<char *>(out->slot_state), 1, 3);
 
     prefetch_payload(out->payload, args.tensor_count(), args.scalar_count());
-#if PTO2_ORCH_PROFILING
-    uint64_t _pt_t2 = get_sys_cnt_aicpu();
-    g_orch_alloc_prefetch_cycle += _pt_t2 - _pt_t1;
-#endif
 
     // Re-bind payload/task pointers each submit. Value is per-slot constant
     // (same as &task_payloads[slot] / &task_descriptors[slot]), but writing
@@ -328,8 +340,6 @@ __attribute__((always_inline)) static inline bool prepare_task(
     // Fields already reset by advance_ring_pointers (eager reset after CONSUMED):
     //   fanout_lock=0, fanout_count=1, fanout_head=nullptr,
     //   fanin_refcount=0, fanout_refcount=0, completed_subtasks=0, next_block_idx=0
-    // Fields immutable after RingSchedState::init_data_from_layout():
-    //   ring_id
     // task_state left as CONSUMED by eager reset (safe for stale wait_for_tensor
     // observers); set to PENDING here when orchestrator actually reuses the slot.
     out->slot_state->task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
@@ -339,14 +349,7 @@ __attribute__((always_inline)) static inline bool prepare_task(
     out->slot_state->logical_block_num = block_num;
     out->slot_state->active_mask = active_mask;
     // fanin_count is set by scheduler during wiring
-#if PTO2_ORCH_PROFILING
-    uint64_t _pt_t3 = get_sys_cnt_aicpu();
-    g_orch_alloc_bind_cycle += _pt_t3 - _pt_t2;
-#endif
     scope_tasks_push(orch, out->slot_state);
-#if PTO2_ORCH_PROFILING
-    g_orch_alloc_scope_push_cycle += get_sys_cnt_aicpu() - _pt_t3;
-#endif
     return true;
 }
 
@@ -486,7 +489,7 @@ __attribute__((always_inline)) static inline TaskOutputTensors submit_task_commo
     TaskOutputTensors result;
     PTO2OutputLayout layout = calculate_output_layout(args);
     PTO2PreparedTask prepared;
-    if (!prepare_task(orch, args, layout.total_output_size, active_mask, &prepared)) {
+    if (UNLIKELY(!prepare_task(orch, args, layout.total_output_size, active_mask, &prepared))) {
         return result;
     }
     CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, prepared.task_id.raw);
@@ -498,8 +501,6 @@ __attribute__((always_inline)) static inline TaskOutputTensors submit_task_commo
     PTO2TaskPayload &payload = *prepared.payload;
     result.set_task_id(task_id);
 
-    
-
 #if PTO2_PROFILING
     if (layout.total_output_size > 0) {
         orch->buffers_allocated++;
@@ -508,7 +509,8 @@ __attribute__((always_inline)) static inline TaskOutputTensors submit_task_commo
 #endif
 
     // === STEP 1: write task descriptor (GM burst — single cache line) ===
-    __builtin_prefetch(&task, 1, 1);
+    // task descriptor is pre-warmed by prefetch_next_task_slot at the tail of
+    // the previous submit (locality=3), so no in-line prefetch here.
     task.task_id = task_id;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = aic_kernel_id;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = aiv0_kernel_id;
@@ -524,35 +526,47 @@ __attribute__((always_inline)) static inline TaskOutputTensors submit_task_commo
     // submit time; deferring to wiring would race against ring advance) and
     // drop the prefix straight into payload.fanin_inline_slot_states[]. wiring
     // will continue extending in compute_task_fanin's emit. ===
-    PTO2FaninBuilder fanin_builder(payload.fanin_inline_slot_states, orch->sm_header->rings[ring_id].fanin_pool);
-    std::atomic<int32_t> *orch_err = &orch->sm_header->orch_error_code;
-    for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
-        PTO2TaskId dep_task_id = args.explicit_dep(i);
-        if (!dep_task_id.is_valid()) {
-            orch->report_fatal(
-                PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.set_dependencies(...) requires valid task ids"
-            );
-            return result;
+    if (LIKELY(args.explicit_dep_count() == 0)) {
+        // Common case (paged_attention and most kernels): no explicit deps.
+        // Skip the FaninBuilder ctor + orch_err lookup + loop entirely so the
+        // hot path is just 2 stack stores to payload.
+        payload.fanin_actual_count = 0;
+        payload.fanin_spill_start = 0;
+    } else {
+        PTO2FaninBuilder fanin_builder(payload.fanin_inline_slot_states);
+        PTO2SharedMemoryRingHeader &consumer_ring = orch->sm_header->rings[ring_id];
+        std::atomic<int32_t> *orch_err = &orch->sm_header->orch_error_code;
+        for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
+            PTO2TaskId dep_task_id = args.explicit_dep(i);
+            if (UNLIKELY(!dep_task_id.is_valid())) {
+                orch->report_fatal(
+                    PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.set_dependencies(...) requires valid task ids"
+                );
+                return result;
+            }
+            PTO2SharedMemoryRingHeader &dep_ring = orch->sm_header->rings[dep_task_id.ring()];
+            int32_t dep_local_task_id = static_cast<int32_t>(dep_task_id.local());
+            int32_t dep_last_task_alive = dep_ring.fc.last_task_alive.load(std::memory_order_acquire);
+            if (dep_local_task_id < dep_last_task_alive) {
+                continue;
+            }
+            PTO2TaskSlotState *producer_slot_state = &dep_ring.get_slot_state_by_task_id(dep_local_task_id);
+            // Spill goes into THIS task's ring's fanin_pool, not the producer's
+            // — pass consumer_ring (was passing dep_ring; ensure_space would
+            // have scanned the wrong payloads on spill).
+            if (UNLIKELY(!append_fanin_or_fail(consumer_ring, orch_err, &fanin_builder, producer_slot_state))) {
+                return result;
+            }
         }
-        PTO2SharedMemoryRingHeader &dep_ring = orch->sm_header->rings[dep_task_id.ring()];
-        int32_t dep_local_task_id = static_cast<int32_t>(dep_task_id.local());
-        int32_t dep_last_task_alive = dep_ring.fc.last_task_alive.load(std::memory_order_acquire);
-        if (dep_local_task_id < dep_last_task_alive) {
-            continue;
-        }
-        PTO2TaskSlotState *producer_slot_state = &dep_ring.get_slot_state_by_task_id(dep_local_task_id);
-        if (!append_fanin_or_fail(dep_ring, orch_err, &fanin_builder, producer_slot_state)) {
-            return result;
-        }
+        payload.fanin_actual_count = fanin_builder.count;
+        payload.fanin_spill_start = fanin_builder.spill_start;
     }
-    payload.fanin_actual_count = fanin_builder.count;
-    payload.fanin_spill_start = fanin_builder.spill_start;
 
 #if PTO2_PROFILING
-    if (args.tensor_dump_selective_requested()) {
+    if (UNLIKELY(args.tensor_dump_selective_requested())) {
         set_dump_tensor_selective_mode(true);
     }
-    if (args.tensor_dump_arg_mask() != 0) {
+    if (UNLIKELY(args.tensor_dump_arg_mask() != 0)) {
         set_dump_tensor_task_mask(task_id.raw, args.tensor_dump_arg_mask());
     }
 #endif
@@ -564,9 +578,9 @@ __attribute__((always_inline)) static inline TaskOutputTensors submit_task_commo
     // register_task_outputs / fanout_count++ / dep_pool prepend / ready push.
     // tag_data() points at args' fixed 16-slot tag array; for_task_submit's
     // 16B memcpy is safe regardless of actual tensor_count.
-    while (!sched->wiring.queue.push(PTO2WiringEvent::for_task_submit(
+    while (UNLIKELY(!sched->wiring.queue.push(PTO2WiringEvent::for_task_submit(
         &cur_slot_state, args.tag_data(), args.tensor_count(), orch->in_manual_scope()
-    ))) {
+    )))) {
         SPIN_WAIT_HINT();
     }
 
@@ -579,6 +593,8 @@ __attribute__((always_inline)) static inline TaskOutputTensors submit_task_commo
 #endif
     g_orch_submit_idx++;
 #endif
+
+    prefetch_next_task_slot(orch, ring_id);
     return result;
 }
 
@@ -587,12 +603,12 @@ TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_k
 
     // Orchestration API should short-circuit after fatal, but keep this entry
     // robust as a no-op in case a caller reaches it directly.
-    if (orch->fatal) {
+    if (UNLIKELY(orch->fatal)) {
         return TaskOutputTensors{};
     }
 
     // Validate Arg construction (errors recorded by add_input/add_output/etc.)
-    if (args.has_error) {
+    if (UNLIKELY(args.has_error)) {
         LOG_ERROR("========================================");
         LOG_ERROR("FATAL: Invalid Arg Detected!");
         LOG_ERROR("========================================");
@@ -620,7 +636,11 @@ TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_k
     bool has_aic = active_mask.has_mask(PTO2_SUBTASK_MASK_AIC);
     bool has_aiv0 = active_mask.has_mask(PTO2_SUBTASK_MASK_AIV0);
     bool has_aiv1 = active_mask.has_mask(PTO2_SUBTASK_MASK_AIV1);
-    if (!has_aic && has_aiv1 && !has_aiv0) {
+    // aiv1-only shape (no aic, no aiv0) requires a kernel-id swap so dispatch
+    // can always use AIV0. Typical tasks are AIC-only, AIV0-only, or AIC+AIV0,
+    // not aiv1-only — hint the renormalize path as cold so the compiler keeps
+    // the hot path tight.
+    if (UNLIKELY(!has_aic && has_aiv1 && !has_aiv0)) {
         normalized.aiv0_kernel_id = normalized.aiv1_kernel_id;
         normalized.aiv1_kernel_id = INVALID_KERNEL_ID;
         active_mask = normalized.to_active_mask();
@@ -633,7 +653,7 @@ TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_k
         // For AIV:     limit is total_aiv_count.
         PTO2ResourceShape shape = active_mask.to_shape();
         int32_t limit = (shape == PTO2ResourceShape::AIV) ? orch->total_aiv_count : orch->total_cluster_count;
-        if (limit > 0 && block_num > limit) {
+        if (UNLIKELY(limit > 0 && block_num > limit)) {
             report_fatal(
                 PTO2_ERROR_REQUIRE_SYNC_START_INVALID, __FUNCTION__,
                 "require_sync_start block_num=%d > limit=%d (deadlock guaranteed)", block_num, limit
@@ -656,11 +676,11 @@ TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_k
 TaskOutputTensors PTO2OrchestratorState::submit_dummy_task(const Arg &args) {
     auto *orch = this;
 
-    if (orch->fatal) {
+    if (UNLIKELY(orch->fatal)) {
         return TaskOutputTensors{};
     }
 
-    if (args.has_error) {
+    if (UNLIKELY(args.has_error)) {
         LOG_ERROR("========================================");
         LOG_ERROR("FATAL: Invalid Arg in submit_dummy_task!");
         LOG_ERROR("========================================");
@@ -679,20 +699,20 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const Arg &args) {
     auto *orch = this;
     // Orchestration API should short-circuit after fatal, but keep this entry
     // robust as a no-op in case a caller reaches it directly.
-    if (orch->fatal) {
+    if (UNLIKELY(orch->fatal)) {
         return TaskOutputTensors{};
     }
 
-    if (args.tensor_count() <= 0) {
+    if (UNLIKELY(args.tensor_count() <= 0)) {
         report_fatal(PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "alloc_tensors requires at least one TensorCreateInfo");
         return TaskOutputTensors{};
     }
-    if (args.scalar_count() != 0) {
+    if (UNLIKELY(args.scalar_count() != 0)) {
         report_fatal(PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "alloc_tensors only accepts output TensorCreateInfo args");
         return TaskOutputTensors{};
     }
     for (int32_t i = 0; i < args.tensor_count(); i++) {
-        if (args.tag(i) != TensorArgType::OUTPUT) {
+        if (UNLIKELY(args.tag(i) != TensorArgType::OUTPUT)) {
             report_fatal(
                 PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "alloc_tensors only accepts output TensorCreateInfo args"
             );
@@ -702,7 +722,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const Arg &args) {
 
     CYCLE_COUNT_START();
 
-    if (args.has_error) {
+    if (UNLIKELY(args.has_error)) {
         report_fatal(
             PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "%s",
             args.error_msg ? args.error_msg : "alloc_tensors failed to construct output-only Arg"
@@ -712,7 +732,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const Arg &args) {
 
     PTO2OutputLayout layout = calculate_output_layout(args);
     PTO2PreparedTask prepared;
-    if (!prepare_task(orch, args, layout.total_output_size, ActiveMask{}, &prepared)) {
+    if (UNLIKELY(!prepare_task(orch, args, layout.total_output_size, ActiveMask{}, &prepared))) {
         return TaskOutputTensors{};
     }
 
@@ -738,6 +758,9 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const Arg &args) {
     TaskOutputTensors outputs;
     outputs.set_task_id(prepared.task_id);
     payload.init(args, outputs, prepared.alloc_result, layout);
+    // Bucket alloc's payload.init into the payload_init lap so it doesn't
+    // distort param_copy (the submit_task path puts the LAP boundary here too).
+    CYCLE_COUNT_LAP(g_orch_payload_init_cycle);
 
     // Reset fanin so PTO2FaninPool::reclaim sees a clean count even though
     // this slot's previous user may have had >FANIN_INLINE_CAP producers.
@@ -745,17 +768,16 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const Arg &args) {
     payload.fanin_actual_count = 0;
     payload.fanin_spill_start = 0;
     CYCLE_COUNT_LAP_RECORD(g_orch_args_cycle, AicpuPhaseId::ORCH_PARAMS, prepared.task_id.raw);
-    if (prepared.slot_state != nullptr) {
-        // Hidden alloc tasks complete inline in the orchestrator before any
-        // consumer can exist, so they have no fanout to notify and no worker
-        // subtasks to retire. Running the full on_mixed_task_complete path
-        // would only pay unnecessary fanout_lock / traversal overhead here.
-        // The generic slot initialization done in prepare_task() is still
-        // required so scope_end can release the producer-side reference and
-        // drive the slot to CONSUMED, but worker dispatch fields are never
-        // observed for hidden alloc tasks.
-        prepared.slot_state->task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
-    }
+    // Hidden alloc tasks complete inline in the orchestrator before any
+    // consumer can exist, so they have no fanout to notify and no worker
+    // subtasks to retire. Running the full on_mixed_task_complete path
+    // would only pay unnecessary fanout_lock / traversal overhead here.
+    // The generic slot initialization done in prepare_task() is still
+    // required so scope_end can release the producer-side reference and
+    // drive the slot to CONSUMED, but worker dispatch fields are never
+    // observed for hidden alloc tasks. prepared.slot_state is always non-null
+    // after prepare_task returns true (unconditionally assigned around line 332).
+    prepared.slot_state->task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
     orch->inline_completed_tasks++;
 
     CYCLE_COUNT_LAP_RECORD(g_orch_fanin_cycle, AicpuPhaseId::ORCH_FANIN, prepared.task_id.raw);
@@ -768,6 +790,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const Arg &args) {
     g_orch_submit_idx++;
 #endif
 
+    prefetch_next_task_slot(orch, prepared.task_id.ring());
     return outputs;
 }
 
@@ -802,16 +825,9 @@ void PTO2OrchestratorState::mark_done() {
 #if PTO2_ORCH_PROFILING
 PTO2OrchProfilingData orchestrator_get_profiling() {
     PTO2OrchProfilingData d;
-    d.sync_cycle = g_orch_sync_cycle;
     d.alloc_cycle = g_orch_alloc_cycle;
-    d.alloc_alloc_cycle = g_orch_alloc_alloc_cycle;
-    d.alloc_prefetch_cycle = g_orch_alloc_prefetch_cycle;
-    d.alloc_bind_cycle = g_orch_alloc_bind_cycle;
-    d.alloc_scope_push_cycle = g_orch_alloc_scope_push_cycle;
     d.payload_init_cycle = g_orch_payload_init_cycle;
     d.args_cycle = g_orch_args_cycle;
-    d.lookup_cycle = g_orch_lookup_cycle;
-    d.insert_cycle = g_orch_insert_cycle;
     d.fanin_cycle = g_orch_fanin_cycle;
     d.scope_end_cycle = g_orch_scope_end_cycle;
     d.submit_count = g_orch_submit_count;
@@ -822,11 +838,8 @@ PTO2OrchProfilingData orchestrator_get_profiling() {
     d.scope_end_atomic_count = g_orch_scope_end_atomic_count;
 
     // Reset
-    g_orch_sync_cycle = g_orch_alloc_cycle = g_orch_args_cycle = 0;
-    g_orch_alloc_alloc_cycle = g_orch_alloc_prefetch_cycle = g_orch_alloc_bind_cycle = 0;
-    g_orch_alloc_scope_push_cycle = 0;
+    g_orch_alloc_cycle = g_orch_args_cycle = 0;
     g_orch_payload_init_cycle = 0;
-    g_orch_lookup_cycle = g_orch_insert_cycle = 0;
     g_orch_fanin_cycle = g_orch_scope_end_cycle = 0;
     g_orch_submit_count = 0;
     g_orch_submit_idx = 0;

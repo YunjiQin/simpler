@@ -633,8 +633,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // Print orchestrator profiling data
 #if PTO2_ORCH_PROFILING
             PTO2OrchProfilingData p = orchestrator_get_profiling();
-            uint64_t total = p.sync_cycle + p.alloc_cycle + p.payload_init_cycle + p.args_cycle + p.lookup_cycle +
-                             p.insert_cycle + p.fanin_cycle;
+            uint64_t total = p.alloc_cycle + p.payload_init_cycle + p.args_cycle + p.fanin_cycle;
             if (total == 0) total = 1;  // avoid div-by-zero
             LOG_INFO_V9(
                 "Thread %d: === Orchestrator Profiling: %" PRId64 " tasks, total=%.3fus ===", thread_idx,
@@ -645,34 +644,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 thread_idx, cycles_to_us(p.alloc_cycle), p.alloc_cycle * 100.0 / total,
                 cycles_to_us(p.alloc_cycle - p.alloc_wait_cycle), cycles_to_us(p.alloc_wait_cycle),
                 static_cast<uint64_t>(p.alloc_atomic_count)
-            );
-            LOG_INFO_V9(
-                "Thread %d:     .alloc       : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.alloc_alloc_cycle),
-                p.alloc_alloc_cycle * 100.0 / total
-            );
-            LOG_INFO_V9(
-                "Thread %d:     .prefetch    : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.alloc_prefetch_cycle),
-                p.alloc_prefetch_cycle * 100.0 / total
-            );
-            LOG_INFO_V9(
-                "Thread %d:     .bind+state  : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.alloc_bind_cycle),
-                p.alloc_bind_cycle * 100.0 / total
-            );
-            LOG_INFO_V9(
-                "Thread %d:     .scope_push  : %.3fus (%.1f%%)", thread_idx,
-                cycles_to_us(p.alloc_scope_push_cycle), p.alloc_scope_push_cycle * 100.0 / total
-            );
-            LOG_INFO_V9(
-                "Thread %d:   sync_tensormap : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.sync_cycle),
-                p.sync_cycle * 100.0 / total
-            );
-            LOG_INFO_V9(
-                "Thread %d:   lookup+dep     : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.lookup_cycle),
-                p.lookup_cycle * 100.0 / total
-            );
-            LOG_INFO_V9(
-                "Thread %d:   tensormap_ins  : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.insert_cycle),
-                p.insert_cycle * 100.0 / total
             );
             LOG_INFO_V9(
                 "Thread %d:   payload_init   : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.payload_init_cycle),

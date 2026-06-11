@@ -33,25 +33,27 @@
 #include "pto_shared_memory.h"   // PTO2SharedMemoryRingHeader
 #include "pto_types.h"           // PTO2_ERROR_NONE, PTO2_ERROR_DEP_POOL_OVERFLOW
 
+// Builder no longer carries the spill_pool reference — the pool is per-ring,
+// and every caller of for_each / contains / append_fanin_or_fail already has
+// the owning ring (and thus ring.fanin_pool) in scope. Dropping the field
+// keeps the builder at 16B on stack and removes one ref-store per construction.
 struct PTO2FaninBuilder {
-    PTO2FaninBuilder(PTO2TaskSlotState **inline_slots_buf, PTO2FaninPool &spill_pool_ref) :
+    explicit PTO2FaninBuilder(PTO2TaskSlotState **inline_slots_buf) :
         count(0),
         spill_start(0),
-        inline_slots(inline_slots_buf),
-        spill_pool(spill_pool_ref) {}
+        inline_slots(inline_slots_buf) {}
     int32_t count{0};
     int32_t spill_start{0};
     PTO2TaskSlotState **inline_slots;
-    PTO2FaninPool &spill_pool;
 
     template <typename Fn>
-    PTO2FaninForEachReturn<Fn> for_each(Fn &&fn) const {
+    PTO2FaninForEachReturn<Fn> for_each(PTO2FaninPool &spill_pool, Fn &&fn) const {
         return for_each_fanin_storage(inline_slots, count, spill_start, spill_pool, static_cast<Fn &&>(fn));
     }
 
-    bool contains(PTO2TaskSlotState *prod_state) const {
+    bool contains(PTO2FaninPool &spill_pool, PTO2TaskSlotState *prod_state) const {
         bool found = false;
-        for_each([&](PTO2TaskSlotState *slot_state) {
+        for_each(spill_pool, [&](PTO2TaskSlotState *slot_state) {
             if (slot_state == prod_state) {
                 found = true;
                 return false;
@@ -67,13 +69,16 @@ struct PTO2FaninBuilder {
 // currently NONE) and returns false. Caller bails out with the same return
 // value.
 //
-// `ring` is used for fanin_pool.ensure_space (spill path).
+// `ring` MUST be the ring that owns the fanin spill_pool the builder draws
+// from — i.e. the *consumer*'s ring, not any producer's ring. `ensure_space`
+// reclaims by scanning that ring's payloads.
 // `err_code` may be nullptr (skip fatal reporting).
 inline bool append_fanin_or_fail(
     PTO2SharedMemoryRingHeader &ring, std::atomic<int32_t> *err_code, PTO2FaninBuilder *fanin_builder,
     PTO2TaskSlotState *prod_state
 ) {
-    if (fanin_builder->contains(prod_state)) {
+    PTO2FaninPool &fanin_pool = ring.fanin_pool;
+    if (fanin_builder->contains(fanin_pool, prod_state)) {
         return true;
     }
 
@@ -82,7 +87,6 @@ inline bool append_fanin_or_fail(
         return true;
     }
 
-    PTO2FaninPool &fanin_pool = fanin_builder->spill_pool;
     auto mark_fatal = [&]() {
         if (err_code != nullptr) {
             int32_t expected = PTO2_ERROR_NONE;
