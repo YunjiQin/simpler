@@ -48,7 +48,6 @@
 #include <cstdint>
 
 #include "common/platform_config.h"
-#include "host_build_graph/runtime/pto_runtime2_types.h"
 
 // =============================================================================
 // Constants
@@ -88,9 +87,6 @@ using TensorDumpArgMask = uint64_t;
 // Zero preserves legacy "dump all tasks" behavior unless selective mode is enabled.
 constexpr TensorDumpArgMask TENSOR_DUMP_ARG_MASK_NONE = 0;
 constexpr uint32_t TENSOR_DUMP_ARG_MASK_BITS = 64;
-constexpr uint32_t TENSOR_DUMP_MASK_POOL_MAX_RINGS = PTO2_MAX_RING_DEPTH;
-constexpr uint32_t TENSOR_DUMP_MASK_POOL_MAX_SLOTS = PTO2_TASK_WINDOW_SIZE;
-constexpr uint32_t TENSOR_DUMP_MASK_POOL_DEFAULT_SLOT_MASK = TENSOR_DUMP_MASK_POOL_MAX_SLOTS - 1;
 constexpr uint8_t TENSOR_DUMP_RECORD_FLAG_ARG_INDEX_AMBIGUOUS = 1u << 0;
 
 // Max kernel ids a record carries: one per active subtask of a task (its mix

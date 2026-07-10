@@ -565,6 +565,7 @@ add_a2a3_runtime_test(test_a2a3_tensormap   a2a3/test_tensormap.cpp)
 add_a2a3_runtime_test(test_fanin_pool       a2a3/test_fanin_pool.cpp)
 add_a2a3_orchestrator_runtime_test(test_a2a3_orchestrator_fanin a2a3/test_orchestrator_fanin.cpp)
 add_a2a3_orchestrator_runtime_test(test_wiring a2a3/test_wiring.cpp)
+add_a2a3_orchestrator_runtime_test(test_a2a3_tensor_dump a2a3/test_tensor_dump.cpp)
 add_a2a3_runtime_test(test_aicore_completion_mailbox a2a3/test_aicore_completion_mailbox.cpp)
 add_a2a3_runtime_test(test_a2a3_scope_stats_collector a2a3/test_scope_stats_collector.cpp)
 
@@ -587,6 +588,7 @@ add_a5_runtime_test(test_a5_tensormap        a5/test_tensormap.cpp)
 add_a5_runtime_test(test_a5_fanin_pool       a5/test_fanin_pool.cpp)
 add_a5_orchestrator_runtime_test(test_a5_orchestrator_fanin a5/test_orchestrator_fanin.cpp)
 add_a5_orchestrator_runtime_test(test_a5_wiring a5/test_wiring.cpp)
+add_a5_orchestrator_runtime_test(test_a5_tensor_dump a5/test_tensor_dump.cpp)
 add_a5_runtime_test(test_a5_aicore_completion_mailbox a5/test_aicore_completion_mailbox.cpp)
 
 # Host logger silent/off behavior — no runtime deps, just compile host_log.cpp

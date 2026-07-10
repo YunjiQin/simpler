@@ -130,14 +130,13 @@ static void clear_dump_args_tables() {
     }
 }
 
-static bool resolve_dump_args_task_slot(uint64_t task_id, uint32_t *idx_out) {
-    uint32_t ring_id = static_cast<uint32_t>(task_id >> 32);
-    if (ring_id >= TENSOR_DUMP_MASK_POOL_MAX_RINGS) {
-        return false;
-    }
-    uint32_t slot = static_cast<uint32_t>(task_id) & TENSOR_DUMP_MASK_POOL_DEFAULT_SLOT_MASK;
-    *idx_out = (ring_id * TENSOR_DUMP_MASK_POOL_MAX_SLOTS + slot) & (DUMP_TASK_MASK_TABLE_CAPACITY - 1);
-    return true;
+// task_id is an opaque 64-bit key (globally unique across rings); fold its two
+// halves so both the ring field (high 32) and the local id (low 32) reach the
+// table index. Any task_id maps to a slot — the pool is independent of runtime
+// ring depth.
+static uint32_t resolve_dump_args_task_slot(uint64_t task_id) {
+    uint64_t h = task_id ^ (task_id >> 32);
+    return static_cast<uint32_t>(h) & (DUMP_TASK_MASK_TABLE_CAPACITY - 1);
 }
 
 extern "C" void
@@ -152,10 +151,7 @@ set_dump_args_task_scalar_dtypes(uint64_t task_id, uint32_t scalar_count, const 
     if (!ensure_dump_args_scalar_dtype_table()) {
         return;
     }
-    uint32_t idx = 0;
-    if (!resolve_dump_args_task_slot(task_id, &idx)) {
-        return;
-    }
+    uint32_t idx = resolve_dump_args_task_slot(task_id);
     for (uint32_t probe = 0; probe < DUMP_TASK_MASK_TABLE_CAPACITY; probe++) {
         DumpTaskScalarDtypeEntry &entry =
             g_dump_scalar_dtype_table[(idx + probe) & (DUMP_TASK_MASK_TABLE_CAPACITY - 1)];
@@ -173,10 +169,7 @@ extern "C" bool get_dump_args_task_scalar_dtypes(uint64_t task_id, uint32_t *sca
     if (g_dump_scalar_dtype_table == nullptr || scalar_count == nullptr || scalar_dtypes == nullptr) {
         return false;
     }
-    uint32_t idx = 0;
-    if (!resolve_dump_args_task_slot(task_id, &idx)) {
-        return false;
-    }
+    uint32_t idx = resolve_dump_args_task_slot(task_id);
     for (uint32_t probe = 0; probe < DUMP_TASK_MASK_TABLE_CAPACITY; probe++) {
         const DumpTaskScalarDtypeEntry &entry =
             g_dump_scalar_dtype_table[(idx + probe) & (DUMP_TASK_MASK_TABLE_CAPACITY - 1)];
@@ -224,12 +217,7 @@ extern "C" void set_dump_args_task_mask(uint64_t task_id, TensorDumpArgMask mask
     if (!ensure_dump_args_mask_table()) {
         return;
     }
-    uint32_t ring_id = static_cast<uint32_t>(task_id >> 32);
-    if (ring_id >= TENSOR_DUMP_MASK_POOL_MAX_RINGS) {
-        return;
-    }
-    uint32_t slot = static_cast<uint32_t>(task_id) & TENSOR_DUMP_MASK_POOL_DEFAULT_SLOT_MASK;
-    uint32_t idx = (ring_id * TENSOR_DUMP_MASK_POOL_MAX_SLOTS + slot) & (DUMP_TASK_MASK_TABLE_CAPACITY - 1);
+    uint32_t idx = resolve_dump_args_task_slot(task_id);
     for (uint32_t probe = 0; probe < DUMP_TASK_MASK_TABLE_CAPACITY; probe++) {
         DumpTaskMaskEntry &entry = g_dump_mask_table[(idx + probe) & (DUMP_TASK_MASK_TABLE_CAPACITY - 1)];
         if (entry.task_id == DUMP_TASK_MASK_EMPTY_TASK_ID || entry.task_id == task_id) {
@@ -252,12 +240,7 @@ extern "C" void get_dump_args_task_masks(uint64_t task_id, TensorDumpArgMask *ma
     if (g_dump_mask_table == nullptr) {
         return;
     }
-    uint32_t ring_id = static_cast<uint32_t>(task_id >> 32);
-    if (ring_id >= TENSOR_DUMP_MASK_POOL_MAX_RINGS) {
-        return;
-    }
-    uint32_t slot = static_cast<uint32_t>(task_id) & TENSOR_DUMP_MASK_POOL_DEFAULT_SLOT_MASK;
-    uint32_t idx = (ring_id * TENSOR_DUMP_MASK_POOL_MAX_SLOTS + slot) & (DUMP_TASK_MASK_TABLE_CAPACITY - 1);
+    uint32_t idx = resolve_dump_args_task_slot(task_id);
     for (uint32_t probe = 0; probe < DUMP_TASK_MASK_TABLE_CAPACITY; probe++) {
         const DumpTaskMaskEntry &entry = g_dump_mask_table[(idx + probe) & (DUMP_TASK_MASK_TABLE_CAPACITY - 1)];
         if (entry.task_id == task_id) {
