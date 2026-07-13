@@ -18,6 +18,7 @@
  */
 
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
@@ -828,8 +829,20 @@ NB_MODULE(_task_interface, m) {
     nb::class_<ChipWorker>(m, "_ChipWorker")
         .def(nb::init<>())
         .def(
-            "init", &ChipWorker::init, nb::arg("host_lib_path"), nb::arg("aicpu_path"), nb::arg("aicore_path"),
-            nb::arg("dispatcher_path"), nb::arg("device_id")
+            "init",
+            [](ChipWorker &self, const std::string &host_lib_path, const std::string &aicpu_path,
+               const std::string &aicore_path, const std::string &dispatcher_path, int device_id,
+               std::optional<CallConfig> prewarm_config) {
+                self.init(
+                    host_lib_path, aicpu_path, aicore_path, dispatcher_path, device_id,
+                    prewarm_config.has_value() ? &(*prewarm_config) : nullptr
+                );
+            },
+            nb::arg("host_lib_path"), nb::arg("aicpu_path"), nb::arg("aicore_path"), nb::arg("dispatcher_path"),
+            nb::arg("device_id"), nb::arg("prewarm_config") = nb::none(),
+            "Bind the runtime library and attach to device_id. When prewarm_config is "
+            "given, its ring sizing is built + cached inside init (fork-constant, no "
+            "cross-process control command). A no-op for runtimes without a prebuilt arena."
         )
         .def("finalize", &ChipWorker::finalize)
         .def(
