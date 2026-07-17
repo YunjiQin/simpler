@@ -9,8 +9,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """L3 post-fork zero-copy host buffers (issue #1027 #1).
 
-A host tensor created *after* the chip children are forked (lazily on the
-first ``Worker.run()``) is not visible to those children: the orch fn runs in
+A host tensor created *after* the chip children are forked (during
+``Worker.init()``) is not visible to those children: the orch fn runs in
 the parent and carries a raw parent VA that is unmapped (or stale) in the child.
 ``Worker.create_host_buffer`` hands back born-shared memory already attached into
 every chip child, so a tensor built over it with ``torch.frombuffer`` round-trips
@@ -97,20 +97,15 @@ class TestPostForkHostBufferZeroCopy(SceneTestCase):
         {"name": "post_fork_zero_copy", "platforms": ["a2a3sim"]},
     ]
 
-    def _force_fork(self, worker, chip_handle):
-        a = torch.full((SIZE,), 2.0, dtype=DTYPE).share_memory_()
-        b = torch.full((SIZE,), 3.0, dtype=DTYPE).share_memory_()
-        out = torch.zeros(SIZE, dtype=DTYPE).share_memory_()
-        worker.run(_one_task_orch(chip_handle, a, b, out), args=None, config=CallConfig())
-        assert torch.allclose(out, _golden(a, b), rtol=self.RTOL, atol=self.ATOL)
-
     def test_run(self, st_worker):
         """Zero-copy: buffers allocated AFTER the fork via ``create_host_buffer``,
-        filled in place, run, and read back — all without a per-run copy."""
+        filled in place, run, and read back — all without a per-run copy.
+
+        ``Worker.init()`` has already forked the chip children, so
+        ``create_host_buffer`` (which requires forked children) is usable
+        immediately — no warm-up run to force the fork is needed."""
         worker = st_worker
         chip_handle = type(self)._st_chip_handles["vector"]
-
-        self._force_fork(worker, chip_handle)
 
         nbytes = SIZE * DTYPE.itemsize  # element count × dtype size, not a magic 4
         ba = worker.create_host_buffer(nbytes)

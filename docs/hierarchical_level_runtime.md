@@ -177,7 +177,7 @@ Communication channels:
 A higher-level `Worker` can register a lower-level `Worker` as a
 NEXT_LEVEL child through the same mailbox protocol L3 uses for chip
 children. The Python `Worker.add_worker(child)` stores an un-init'd child
-Worker; on first `run()`, the parent forks a child process that inits the
+Worker; on `init()`, the parent forks a child process that inits the
 inner Worker and enters a mailbox-polling loop (`_child_worker_loop`).
 
 ```python
@@ -214,7 +214,7 @@ Worker opens its own scope, executes the orch function with its own
 — recursion is symmetric.
 
 **Nested fork ordering**: L3's own children (sub/chip) are forked **inside**
-the L4 child process, on L3's first `run()`. This keeps the process tree
+the L4 child process, during L3's eager `init()`. This keeps the process tree
 clean: L4 parent → L3 child → L3's sub/chip grandchildren.
 
 **Mode per level is independent**: L3 can use PROCESS (chip children), while

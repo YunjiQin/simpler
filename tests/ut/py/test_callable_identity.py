@@ -501,6 +501,9 @@ def test_remote_worker_id_stays_stable_when_local_worker_is_added_later(monkeypa
 
     monkeypatch.setattr(worker_mod, "_Worker", fake_worker_ctor)
     monkeypatch.setattr(Worker, "_open_remote_session", fake_open_remote_session)
+    # This test exercises _init_hierarchical's remote-id bookkeeping with a
+    # fake C worker; stub the eager fork+start so it isn't driven here.
+    monkeypatch.setattr(Worker, "_start_hierarchical", lambda self: None)
 
     worker = Worker(level=4, num_sub_workers=0)
     try:

@@ -233,6 +233,10 @@ _HOST_BUF_UNMAP = struct.Struct("<Q")
 # mapping (the pure-Python blob-rewrite scheme, no runtime C++ change).
 _BLOB_TENSOR_STRIDE = 128
 _BLOB_HEADER_BYTES = 8
+# Byte offset of Tensor.child_memory within the 128 B Tensor (static_assert in
+# src/common/task_interface/tensor.h pins it to 43): 1 ⇒ chip-owned device
+# pointer (never a host buffer, so never blob-rewritten).
+_BLOB_TENSOR_CHILD_MEMORY_OFF = 43
 
 # Layout of the CTRL_COMM_INIT request shm.
 _COMM_INIT_HEADER = struct.Struct("<II")  # rank (u32), nranks (u32)
@@ -404,11 +408,18 @@ def _rewrite_blob_host_addrs(buf: memoryview, blob_off: int, ranges: list[tuple[
     """Redirect registered host pointers in a task-args blob to child mappings.
 
     ``ranges`` is ``(parent_lo, parent_hi, child_base)`` for each host buffer the
-    child has mapped via _CTRL_MAP_HOST. For every tensor whose ``buffer.addr``
-    (a parent VA) lands in a registered range, rewrite it in place to
-    ``child_base + (addr - parent_lo)`` so the runtime dereferences the child's
+    child has mapped via _CTRL_MAP_HOST. For every *host* tensor whose
+    ``buffer.addr`` (a parent VA) lands in a registered range, rewrite it in place
+    to ``child_base + (addr - parent_lo)`` so the runtime dereferences the child's
     own mapping. Tensors outside every range (fork-inherited or child-allocated)
     are left untouched. See _BLOB_TENSOR_STRIDE for the wire layout.
+
+    ``child_memory`` tensors (``Tensor.child_memory != 0`` — a chip-owned device
+    pointer such as an HCCL comm-window slot) are NEVER rewritten: their numeric
+    VA is a device address in the child, unrelated to any parent host VA, and can
+    coincidentally fall inside a registered host-buffer range. Rewriting one would
+    redirect e.g. a collective's window pointer into a create_host_buffer mapping
+    and deadlock the exchange.
     """
     tensor_count = struct.unpack_from("<i", buf, blob_off)[0]
     if tensor_count <= 0:
@@ -416,6 +427,10 @@ def _rewrite_blob_host_addrs(buf: memoryview, blob_off: int, ranges: list[tuple[
     base = blob_off + _BLOB_HEADER_BYTES
     for i in range(tensor_count):
         addr_off = base + i * _BLOB_TENSOR_STRIDE
+        # Tensor.child_memory is byte 43 of the 128 B Tensor (static_assert in
+        # tensor.h); skip device pointers, only host buffers are rewritten.
+        if buf[addr_off + _BLOB_TENSOR_CHILD_MEMORY_OFF]:
+            continue
         addr = struct.unpack_from("<Q", buf, addr_off)[0]
         for parent_lo, parent_hi, child_base in ranges:
             if parent_lo <= addr < parent_hi:
@@ -1799,7 +1814,6 @@ class Worker:
             raise RuntimeError("remote memory APIs require Worker.init() before allocation or copy")
         if int(worker_id) not in set(self._remote_worker_ids):
             raise ValueError("remote memory APIs require a remote worker id returned by add_remote_worker")
-        self._start_hierarchical()
         if self._worker is None:
             raise RuntimeError("remote memory APIs require a started hierarchical Worker")
 
@@ -2381,7 +2395,6 @@ class Worker:
                 handle, _is_new = self._install_registration_locked(reg)
                 return handle
 
-        self._start_hierarchical()
         if self._worker is None:
             raise RuntimeError("Worker.register(RemoteCallable): hierarchical worker is not started")
 
@@ -2910,7 +2923,6 @@ class Worker:
         errors: list[str] = []
         try:
             if self._initialized:
-                self._start_hierarchical()
                 assert self._worker is not None
                 for worker_id in worker_ids:
                     try:
@@ -3060,17 +3072,16 @@ class Worker:
                 (``runtime_env.ring_task_window`` / ``ring_heap`` /
                 ``ring_dep_pool``) is built + cached so the first ``run`` with the
                 same sizing skips the (~800ms) cold prebuilt runtime-arena build.
-                Timing is level-dependent: an L2 worker prewarms here in
-                ``init``; an L3+ worker has no chip children until the hierarchy
-                starts on the first ``run``, so it prewarms there — during
-                hierarchy startup, alongside the callable SO upload and before the
-                first task dispatches. A no-op for runtimes without a prebuilt
-                arena (host_build_graph). ``None`` (default) disables prewarm.
+                Both L2 and L3+ workers prewarm here in ``init``: an L3+ worker
+                forks its chip children and starts the hierarchy in ``init``
+                too, prewarming during that startup — alongside the callable SO
+                upload and before the first task dispatches. A no-op for runtimes
+                without a prebuilt arena (host_build_graph). ``None`` (default)
+                disables prewarm.
         """
         if self._initialized:
             raise RuntimeError("Worker already initialized")
-        # Validate up front so a bad config fails here regardless of level, even
-        # though an L3+ worker does not build the arena until the first run.
+        # Validate up front so a bad config fails here before any fork.
         if prewarm_config is not None:
             prewarm_config.validate()
         self._prewarm_config = prewarm_config
@@ -3080,6 +3091,11 @@ class Worker:
                 self._init_level2()
             elif self.level >= 3:
                 self._init_hierarchical()
+                # Fork the chip/sub children and start the C++ scheduler now,
+                # so the whole L2 hierarchy is live (children forked,
+                # ChipWorker.init done, callables uploaded H2D) by the time
+                # init() returns.
+                self._start_hierarchical()
             else:
                 raise ValueError(f"Worker: level {self.level} not supported")
         except BaseException:
@@ -3195,7 +3211,12 @@ class Worker:
         self._hierarchical_started = False
 
     def _start_hierarchical(self) -> None:  # noqa: PLR0912 -- three parallel fork loops (sub/chip/next) + bootstrap wait + scheduler register/init; branches track the fork order documented in the body
-        """Fork child processes and start C++ scheduler. Called on first run()."""
+        """Fork child processes and start C++ scheduler.
+
+        Called once from init() for L3+ workers. The "starting"/"started"
+        state machine still guards against a concurrent register/unregister
+        thread racing an in-progress startup.
+        """
         device_ids = self._config.get("device_ids", [])
         n_sub = self._config.get("num_sub_workers", 0)
 
@@ -3283,10 +3304,10 @@ class Worker:
 
             # Fork next-level Worker children (L4+ with Worker children).
             # Each child process: init the inner Worker (which mmaps its own
-            # HeapRing and allocates its own child mailboxes), then enter
-            # _child_worker_loop. The inner Worker's own children are forked
-            # lazily on first run() inside _child_worker_loop, so the process
-            # tree nests correctly: L4 → L3 child → L3's chip/sub children.
+            # HeapRing, allocates its own child mailboxes, and — since init is
+            # eager — forks its own chip/sub children in turn), then enter
+            # _child_worker_loop. The process tree nests correctly:
+            # L4 → L3 child → L3's chip/sub children.
             for idx, inner_worker in enumerate(self._next_level_workers):
                 pid = os.fork()
                 if pid == 0:
@@ -3365,9 +3386,10 @@ class Worker:
         """Tear down all forked children + shms after a bootstrap failure.
 
         Best-effort: SIGKILL every child we spawned, reap them, then close
-        and unlink every mailbox.  Called only from the init() failure path,
-        so `dw.init()` has not run and the C++ scheduler is not holding any
-        mailbox references.
+        and unlink every mailbox.  Called from the init() failure path via
+        _cleanup_partial_init, which closes the C++ _Worker (stopping the
+        scheduler + WorkerThreads) *before* this runs, so no C++ thread holds
+        a mailbox reference when the children are killed.
         """
         pids = list(self._chip_pids) + list(self._sub_pids) + list(self._next_level_pids)
         for pid in pids:
@@ -4030,10 +4052,10 @@ class Worker:
         """Allocate a born-shared host buffer, attached into every chip child,
         that a later ``run()`` reads/writes with **no per-run copy**.
 
-        L3 chip children are forked lazily on the first ``run()``; memory created
-        afterwards is not in their address space. This hands you memory that is
-        *born* in a shm already attached into every child, so there is nothing to
-        copy: the child reads and writes the same physical pages the parent sees.
+        L3 chip children are forked during ``init()``; memory created afterwards
+        is not in their address space. This hands you memory that is *born* in a
+        shm already attached into every child, so there is nothing to copy: the
+        child reads and writes the same physical pages the parent sees.
 
         Returns a :class:`HostBuffer` whose ``buffer`` is a ``memoryview`` over
         that shm. Build a tensor over it with the buffer protocol, framework of
@@ -4055,7 +4077,6 @@ class Worker:
             raise TypeError("create_host_buffer requires a level >= 3 Worker")
         if not self._initialized:
             raise RuntimeError("create_host_buffer requires Worker.init() before allocation")
-        self._start_hierarchical()
         if not self._chip_shms:
             raise RuntimeError("create_host_buffer requires forked chip children (none are configured)")
         assert self._worker is not None
@@ -4339,7 +4360,6 @@ class Worker:
             self._chip_worker._run_slot(state.slot_id, args, cfg)
             return None
 
-        self._start_hierarchical()
         assert self._orch is not None
         assert self._worker is not None
         # Drop any error stashed by a previous run() so this call starts

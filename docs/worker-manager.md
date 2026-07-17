@@ -263,12 +263,11 @@ When an L4 Worker has L3 Worker children, the fork sequence nests:
 ```text
 L4 parent process
   ├─ _init_hierarchical(): Worker(4) + HeapRing mmap (before fork)
-  └─ _start_hierarchical() (on first run):
+  └─ _start_hierarchical() (eager, in init()):
        ├─ fork L3 child  ────────►  L3 child process:
        │                              inner_worker.init()  ← Worker(3) + L3 HeapRing
+       │                                └─ _start_hierarchical() forks L3's sub/chip children
        │                              _child_worker_loop()
-       │                                └─ on first dispatch: inner_worker.run()
-       │                                     └─ _start_hierarchical() forks L3's sub/chip children
        └─ register mailbox with L4's Worker
 ```
 

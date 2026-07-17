@@ -306,6 +306,65 @@ def _build_l3_task_args(test_args: TaskArgsBuilder, orch_signature: list):
     return chip_args, output_names
 
 
+def _rehost_task_tensors_on_chip_buffers(worker, test_args: TaskArgsBuilder):
+    """Back each tensor arg with its own ``Worker.create_host_buffer`` region.
+
+    An L3 ``Worker.init()`` forks its chip children, so tensors allocated by
+    ``generate_args`` afterwards (raw ``share_memory_()``) are not in a child's
+    address space — dispatching their VA segfaults the child. ``create_host_buffer``
+    hands back born-shared memory already attached into every chip child, so a
+    tensor built over it round-trips with no per-run copy. Each tensor is copied
+    once into its own such buffer and the builder is mutated in place to point at
+    it.
+
+    Each tensor gets a **separate** buffer, never one packed region: the
+    Orchestrator infers task dependencies from tensor address ranges, so distinct
+    args must occupy distinct, non-adjacent allocations — packing them together
+    aliases unrelated tensors into one range and corrupts the dependency wiring.
+
+    Returns the ``HostBuffer`` handles to free after the run (via
+    :func:`_free_chip_host_buffers`). No-op — returns ``[]`` — when the worker has
+    no chip children (sub-only L3); sub-worker visibility is a separate mechanism.
+    """
+    import torch  # noqa: PLC0415
+
+    if not getattr(worker, "_chip_shms", None):
+        return []
+    handles = []
+    for idx, spec in enumerate(test_args.specs):
+        if not isinstance(spec, Tensor) or not isinstance(spec.value, torch.Tensor):
+            continue
+        src = spec.value
+        if src.numel() == 0:
+            continue
+        buf = worker.create_host_buffer(src.numel() * src.element_size())
+        hosted = torch.frombuffer(buf.buffer, dtype=src.dtype, count=src.numel()).reshape(src.shape)
+        hosted.copy_(src)
+        test_args._specs[idx] = Tensor(spec.name, hosted)
+        test_args._data[spec.name] = hosted
+        handles.append(buf)
+    return handles
+
+
+def _free_chip_host_buffers(worker, test_args: TaskArgsBuilder, handles):
+    """Drop the host-backed tensor views, then free their buffers.
+
+    A live view keeps the shm pages exported, so the tensors must be released
+    before ``free_host_buffer`` (which otherwise only warns). Safe to call with an
+    empty ``handles`` list.
+    """
+    if not handles:
+        return
+    import gc  # noqa: PLC0415
+
+    for name in test_args.tensor_names():
+        test_args._data[name] = None
+    test_args._specs = [s for s in test_args._specs if not isinstance(s, Tensor)]
+    gc.collect()
+    for buf in handles:
+        worker.free_host_buffer(buf)
+
+
 @contextmanager
 def _temporary_env(env_updates):
     """Temporarily set environment variables."""
@@ -1102,58 +1161,65 @@ class SceneTestCase:
 
         # Build args
         test_args = self.generate_args(params)
+        # Worker.init() has already forked the chip children, so tensors built
+        # here must live in born-shared memory to be visible to them. Rehost onto
+        # per-tensor create_host_buffer regions; freed in the finally below.
+        host_bufs = _rehost_task_tensors_on_chip_buffers(worker, test_args)
 
-        # Compute golden (unless skip_golden)
-        golden_args = None
-        if not skip_golden:
-            golden_args = test_args.clone()
-            self.compute_golden(golden_args, params)
-
-        # Save initial tensor values for reset between rounds
-        all_tensor_names = test_args.tensor_names()
-        initial_tensors = {}
-        if rounds > 1:
-            for name in all_tensor_names:
-                initial_tensors[name] = getattr(test_args, name).clone()
-
-        # Build CallableNamespace: compiled ChipCallables + sub callable IDs
-        ns = CallableNamespace({**compiled_callables, **sub_handles})
-
-        # Get orch function (plain function from CALLABLE)
-        orch_fn = self.CALLABLE["orchestration"]
-
-        # Execute rounds. As for L2 (see _run_and_validate_l2), per-round timing
-        # is obtained offline from the `[STRACE]` stderr markers via
-        # `strace_timing --rounds-table`; the L3 chip children emit their own
-        # markers (grouped by (pid, inv)), so multi-round works without any
-        # inline fd capture here.
-        for round_idx in range(rounds):
-            if round_idx > 0:
-                for name, initial in initial_tensors.items():
-                    getattr(test_args, name).copy_(initial)
-
-            # See _run_and_validate_l2: the per-round masking is dead code
-            # under the existing upstream gate. Keep parity by passing through.
-            config = self._build_config(
-                config_dict,
-                enable_l2_swimlane=enable_l2_swimlane,
-                enable_dump_args=enable_dump_args,
-                enable_pmu=enable_pmu,
-                enable_dep_gen=enable_dep_gen,
-                enable_scope_stats=enable_scope_stats,
-                output_prefix=output_prefix,
-            )
-
-            # Orch fn signature: (orch, args, cfg) — inner fn forwards to
-            # the user's scene orch which takes (orch, callables, task_args, config).
-            def task_orch(orch, _args, _cfg, _ns=ns, _test_args=test_args, _config=config):
-                orch_fn(orch, _ns, _test_args, _config)
-
-            with _temporary_env(self._resolve_env()):
-                worker.run(task_orch)
-
+        try:
+            # Compute golden (unless skip_golden)
+            golden_args = None
             if not skip_golden:
-                _compare_outputs(test_args, golden_args, all_tensor_names, self.RTOL, self.ATOL)
+                golden_args = test_args.clone()
+                self.compute_golden(golden_args, params)
+
+            # Save initial tensor values for reset between rounds
+            all_tensor_names = test_args.tensor_names()
+            initial_tensors = {}
+            if rounds > 1:
+                for name in all_tensor_names:
+                    initial_tensors[name] = getattr(test_args, name).clone()
+
+            # Build CallableNamespace: compiled ChipCallables + sub callable IDs
+            ns = CallableNamespace({**compiled_callables, **sub_handles})
+
+            # Get orch function (plain function from CALLABLE)
+            orch_fn = self.CALLABLE["orchestration"]
+
+            # Execute rounds. As for L2 (see _run_and_validate_l2), per-round timing
+            # is obtained offline from the `[STRACE]` stderr markers via
+            # `strace_timing --rounds-table`; the L3 chip children emit their own
+            # markers (grouped by (pid, inv)), so multi-round works without any
+            # inline fd capture here.
+            for round_idx in range(rounds):
+                if round_idx > 0:
+                    for name, initial in initial_tensors.items():
+                        getattr(test_args, name).copy_(initial)
+
+                # See _run_and_validate_l2: the per-round masking is dead code
+                # under the existing upstream gate. Keep parity by passing through.
+                config = self._build_config(
+                    config_dict,
+                    enable_l2_swimlane=enable_l2_swimlane,
+                    enable_dump_args=enable_dump_args,
+                    enable_pmu=enable_pmu,
+                    enable_dep_gen=enable_dep_gen,
+                    enable_scope_stats=enable_scope_stats,
+                    output_prefix=output_prefix,
+                )
+
+                # Orch fn signature: (orch, args, cfg) — inner fn forwards to
+                # the user's scene orch which takes (orch, callables, task_args, config).
+                def task_orch(orch, _args, _cfg, _ns=ns, _test_args=test_args, _config=config):
+                    orch_fn(orch, _ns, _test_args, _config)
+
+                with _temporary_env(self._resolve_env()):
+                    worker.run(task_orch)
+
+                if not skip_golden:
+                    _compare_outputs(test_args, golden_args, all_tensor_names, self.RTOL, self.ATOL)
+        finally:
+            _free_chip_host_buffers(worker, test_args, host_bufs)
 
     # ------------------------------------------------------------------
     # pytest auto test method
