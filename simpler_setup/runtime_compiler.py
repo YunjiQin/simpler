@@ -189,9 +189,14 @@ class RuntimeCompiler:
     def _init_a5(self):
         """Initialize toolchains for real a5 hardware."""
         env_manager.ensure("ASCEND_HOME_PATH")
-        # A5 PTO async workspace overlays are opt-in until the CI CANN package
-        # exposes the required primitives reliably; see #1315.
+        # The PTO async workspace overlays (SDMA / URMA) are opt-in until the
+        # CI CANN package exposes the required primitives reliably; see #1315.
+        # When either is opted in the host build embeds pto-isa headers and
+        # must use the same pinned managed checkout as a2a3 (#1351).
         if _sdma_workspace_enabled() or _urma_workspace_enabled():
+            from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
+
+            os.environ["PTO_ISA_ROOT"] = ensure_pto_isa_root(verbose=True)
             env_manager.ensure("PTO_ISA_ROOT")
 
         # AICore: Bisheng CCE compiler with A5 platform

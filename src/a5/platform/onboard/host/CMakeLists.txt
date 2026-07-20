@@ -130,6 +130,12 @@ if(SIMPLER_ENABLE_PTO_URMA_WORKSPACE)
     target_compile_definitions(host_runtime PRIVATE SIMPLER_ENABLE_PTO_URMA_WORKSPACE=1)
 endif()
 
+# Bake the resolved pto-isa commit into the compile command when an overlay
+# embeds pto-isa headers into this .so. A pto-isa pin bump leaves runtime HEAD
+# — and often header mtimes — untouched, so without this define ccache
+# (compiler_check=mtime) can serve a stale object. Mirror of the a2a3 block
+# (#1351); the cache var stays empty for default-OFF a5 builds, so this is a
+# no-op unless the SDMA or URMA overlay is on.
 set(SIMPLER_PTO_ISA_BUILD_COMMIT "" CACHE STRING
     "PTO-ISA commit used for host_runtime cache key")
 if(NOT "${SIMPLER_PTO_ISA_BUILD_COMMIT}" STREQUAL "")
