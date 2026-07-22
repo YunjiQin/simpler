@@ -16,10 +16,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
+#include <vector>
 
 #include <gtest/gtest.h>
 
 #include "buffer_handle.h"
+#include "task_args.h"
 
 namespace {
 
@@ -149,6 +152,84 @@ TEST(BufferHandleAbi, IdentityHashMatchesEquality) {
     b.identity.generation = a.identity.generation + 1;
     // Not a strict requirement, but a good hash separates the ABA case.
     EXPECT_NE(h(a.identity), h(b.identity));
+}
+
+// --- BufferRef wire blob: versioned length-prefixed round trip + rejection ---------------------
+
+BufferRef make_ref_b() {
+    BufferRef r = make_ref();
+    r.identity.buffer_id = 99;
+    r.byte_offset = 0;
+    r.ndims = 1;
+    r.shapes[0] = 5;
+    r.strides[0] = 1;
+    r.dtype = DataType::INT32;
+    return r;
+}
+
+TEST(BufferRefBlob, RoundTrip) {
+    BufferRef refs[2] = {make_ref(), make_ref_b()};
+    uint64_t scalars[2] = {42, 0xC0FFEE};
+    size_t sz = bufferref_blob_size(2, 2);
+    EXPECT_EQ(sz, BUFFERREF_BLOB_HEADER_SIZE + 2 * sizeof(BufferRef) + 2 * sizeof(uint64_t));
+
+    std::vector<uint8_t> buf(sz);
+    write_bufferref_blob(buf.data(), refs, 2, scalars, 2);
+
+    BufferRefBlobView v = read_bufferref_blob(buf.data(), sz);
+    ASSERT_EQ(v.ref_count, 2);
+    ASSERT_EQ(v.scalar_count, 2);
+    BufferRef r0 = v.ref(0);
+    BufferRef r1 = v.ref(1);
+    EXPECT_EQ(std::memcmp(&r0, &refs[0], sizeof(BufferRef)), 0);
+    EXPECT_EQ(std::memcmp(&r1, &refs[1], sizeof(BufferRef)), 0);
+    EXPECT_EQ(v.scalars[0], 42u);
+    EXPECT_EQ(v.scalars[1], 0xC0FFEEu);
+}
+
+TEST(BufferRefBlob, EmptyBlob) {
+    size_t sz = bufferref_blob_size(0, 0);
+    EXPECT_EQ(sz, BUFFERREF_BLOB_HEADER_SIZE);
+    std::vector<uint8_t> buf(sz);
+    write_bufferref_blob(buf.data(), nullptr, 0, nullptr, 0);
+    BufferRefBlobView v = read_bufferref_blob(buf.data(), sz);
+    EXPECT_EQ(v.ref_count, 0);
+    EXPECT_EQ(v.scalar_count, 0);
+}
+
+TEST(BufferRefBlob, RejectsUnknownVersion) {
+    std::vector<uint8_t> buf(bufferref_blob_size(0, 0));
+    write_bufferref_blob(buf.data(), nullptr, 0, nullptr, 0);
+    uint32_t bad = BUFFER_ABI_VERSION + 1;
+    std::memcpy(buf.data(), &bad, sizeof(bad));
+    EXPECT_THROW(read_bufferref_blob(buf.data(), buf.size()), std::runtime_error);
+}
+
+TEST(BufferRefBlob, RejectsTruncatedCapacity) {
+    BufferRef refs[1] = {make_ref()};
+    std::vector<uint8_t> buf(bufferref_blob_size(1, 0));
+    write_bufferref_blob(buf.data(), refs, 1, nullptr, 0);
+    // Header claims 1 ref but capacity covers only the header.
+    EXPECT_THROW(read_bufferref_blob(buf.data(), BUFFERREF_BLOB_HEADER_SIZE), std::runtime_error);
+    // Capacity below even the header.
+    EXPECT_THROW(read_bufferref_blob(buf.data(), 4), std::runtime_error);
+}
+
+TEST(BufferRefBlob, RejectsNegativeCount) {
+    std::vector<uint8_t> buf(64, 0);
+    uint32_t ver = BUFFER_ABI_VERSION;
+    std::memcpy(buf.data() + 0, &ver, sizeof(ver));
+    int32_t neg = -1;
+    std::memcpy(buf.data() + 4, &neg, sizeof(neg));  // ref_count = -1
+    EXPECT_THROW(read_bufferref_blob(buf.data(), buf.size()), std::runtime_error);
+}
+
+TEST(BufferRefBlob, RejectsNonZeroReserved) {
+    std::vector<uint8_t> buf(bufferref_blob_size(0, 0));
+    write_bufferref_blob(buf.data(), nullptr, 0, nullptr, 0);
+    uint32_t dirty = 1;
+    std::memcpy(buf.data() + 12, &dirty, sizeof(dirty));  // reserved header word
+    EXPECT_THROW(read_bufferref_blob(buf.data(), buf.size()), std::runtime_error);
 }
 
 }  // namespace
