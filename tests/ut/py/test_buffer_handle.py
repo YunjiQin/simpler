@@ -32,6 +32,7 @@ from simpler.buffer_handle import (
     create_host_shared_buffer,
     mint_owner_instance_id,
     pack_bufferref_blob,
+    wrap_fork_inherited,
 )
 
 _OID = bytes(range(0xA0, 0xA0 + OWNER_INSTANCE_ID_BYTES))
@@ -150,6 +151,32 @@ def test_resolve_unregistered_raises():
     reg = ImportRegistry()
     with pytest.raises(KeyError):
         reg.resolve(_identity())
+
+
+def test_fork_inherited_zero_copy_materialize():
+    # A pre-fork COW-inherited allocation: the FORK_SHM body is the base VA, materialized in place
+    # (no shm, no copy). In-process the VA is trivially valid.
+    backing = ctypes.create_string_buffer(64)
+    addr = ctypes.addressof(backing)
+    oid = mint_owner_instance_id()
+    handle = wrap_fork_inherited(addr, 64, owner_instance_id=oid, buffer_id=5, owner_worker_path="L3")
+    assert handle.backend_kind == BackendKind.FORK_SHM
+    assert handle.access == AccessMode.READ
+    assert handle.shm is None
+    reg = ImportRegistry()
+    try:
+        ref = handle.ref(shapes=(16,), strides=(1,), dtype=DataType.INT32.value, byte_offset=4)
+        blob = pack_bufferref_blob([ref])
+        src = ctypes.create_string_buffer(blob, len(blob))
+        resolved = reg.materialize_blob(ctypes.addressof(src), len(blob))
+        assert reg.resolve(handle.identity).base == addr  # same VA, no mapping
+        tensor_blob = materialize_bufferref_blob(ctypes.addressof(src), len(blob), resolved)
+        dst = ctypes.create_string_buffer(tensor_blob, len(tensor_blob))
+        args = read_args_from_blob(ctypes.addressof(dst))
+        assert args.tensor(0).data == addr + 4
+    finally:
+        reg.close()
+        handle.close()  # no-op: FORK_SHM owns no shm
 
 
 def test_materialize_remote_sidecar_rejected():

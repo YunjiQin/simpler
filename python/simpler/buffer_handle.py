@@ -310,6 +310,37 @@ def create_host_shared_buffer(
     )
 
 
+def wrap_fork_inherited(
+    data_ptr: int,
+    nbytes: int,
+    owner_instance_id: bytes,
+    buffer_id: int,
+    owner_worker_path: str = "",
+    generation: int = 0,
+    access: AccessMode = AccessMode.READ,
+) -> BufferHandle:
+    """Wrap a pre-fork, COW-inherited host allocation as a zero-copy ``FORK_SHM`` ``BufferHandle``.
+
+    A tensor allocated before the chip children were forked is present in every child at the *same*
+    virtual address (copy-on-write). The backend body is that base VA (u64 LE); the consumer
+    materializes to the same VA with no mapping and no copy. Because COW splits a page on the child's
+    first write, this is read-only from the child's side (``access`` defaults to READ) — an output the
+    parent must read back needs a shm backing (``create_host_shared_buffer``) instead.
+    """
+    identity = CanonicalIdentity(owner_instance_id, buffer_id, owner_worker_path, generation)
+    return BufferHandle(
+        identity=identity,
+        address_space=AddressSpace.HOST,
+        visibility=Visibility.SHARED,
+        access=access,
+        backend_kind=BackendKind.FORK_SHM,
+        nbytes=nbytes,
+        body=int(data_ptr).to_bytes(8, "little"),
+        shm=None,
+        base=int(data_ptr),
+    )
+
+
 @dataclass
 class ImportedBuffer:
     """A handle materialized into the consumer's address space: identity -> local base."""
@@ -342,7 +373,12 @@ class ImportRegistry:
         cached = self._by_identity.get(key)
         if cached is not None:
             return cached
-        if desc.backend_kind in (BackendKind.POSIX_SHM, BackendKind.FORK_SHM):
+        if desc.backend_kind == BackendKind.FORK_SHM:
+            # COW-inherited at the same VA in every forked child: the body is the base VA (u64 LE),
+            # already valid in this process — no mapping.
+            base = int.from_bytes(desc.body, "little")
+            imported = ImportedBuffer(desc.identity, base, desc.nbytes, desc.address_space, None)
+        elif desc.backend_kind == BackendKind.POSIX_SHM:
             shm = SharedMemory(name=desc.body.decode("utf-8"))
             imported = ImportedBuffer(desc.identity, _shm_base_addr(shm), desc.nbytes, desc.address_space, shm)
         elif desc.backend_kind == BackendKind.REMOTE_SIDECAR:
