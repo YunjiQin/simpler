@@ -252,6 +252,27 @@ class BufferHandle:
             body=self.body,
         )
 
+    def ref(
+        self,
+        shapes: tuple[int, ...],
+        strides: tuple[int, ...],
+        dtype: int,
+        byte_offset: int = 0,
+    ) -> BufferRef:
+        """A self-describing BufferRef viewing this handle: embeds the full descriptor + the view.
+
+        The consumer materializes it with no prior handshake. ``strides`` are in elements, row-major,
+        strictly positive; ``byte_offset`` must be a multiple of the dtype size (checked at
+        materialization).
+        """
+        return BufferRef(
+            handle=self.to_descriptor(),
+            byte_offset=byte_offset,
+            shapes=tuple(shapes),
+            strides=tuple(strides),
+            dtype=int(dtype),
+        )
+
     def close(self) -> None:
         if self.shm is not None:
             self.shm.close()

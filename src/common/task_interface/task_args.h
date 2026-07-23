@@ -311,10 +311,10 @@ inline TaskArgsView read_blob(const uint8_t *src, size_t capacity) {
 //   offset 4:         int32    ref_count = R
 //   offset 8:         int32    scalar_count = S
 //   offset 12:        uint32   reserved (= 0)
-//   offset 16:        BufferRef refs[R]           (96 B each)
-//   offset 16 + 96R:  uint64_t  scalars[S]
+//   offset 16:        BufferRef refs[R]           (sizeof(BufferRef) B each)
+//   offset 16 + R*sizeof(BufferRef):  uint64_t  scalars[S]
 //
-// The element is BufferRef (canonical identity + view, no materialized addr) and the envelope
+// The element is BufferRef (embedded handle descriptor + view, no materialized addr) and the envelope
 // carries abi_version so a decoder rejects an unknown layout rather than misreading it. The
 // reserved word 8-aligns refs[0] (whose first field is a u64) and gates a future layout bump: a
 // non-zero reserved is rejected.

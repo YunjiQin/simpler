@@ -178,10 +178,11 @@ def test_materialize_bufferref_blob_to_tensors():
     h1 = create_host_shared_buffer(nbytes=128, owner_instance_id=oid, buffer_id=2, generation=3)
     reg = ImportRegistry()
     try:
-        # Self-describing: refs embed the full descriptor; the consumer materializes lazily from the
-        # blob (no prior register), map-once by identity.
-        ref0 = BufferRef(h0.to_descriptor(), byte_offset=0, shapes=(4,), strides=(1,), dtype=DataType.FLOAT32.value)
-        ref1 = BufferRef(h1.to_descriptor(), byte_offset=8, shapes=(2, 4), strides=(4, 1), dtype=DataType.FLOAT16.value)
+        # Self-describing: refs embed the full descriptor (built via BufferHandle.ref); the consumer
+        # materializes lazily from the blob (no prior register), map-once by identity.
+        ref0 = h0.ref(shapes=(4,), strides=(1,), dtype=DataType.FLOAT32.value)
+        ref1 = h1.ref(shapes=(2, 4), strides=(4, 1), dtype=DataType.FLOAT16.value, byte_offset=8)
+        assert ref0.handle == h0.to_descriptor()
         blob = pack_bufferref_blob([ref0, ref1], scalars=(42,))
         src = ctypes.create_string_buffer(blob, len(blob))
 
