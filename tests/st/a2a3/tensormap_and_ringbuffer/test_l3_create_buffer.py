@@ -7,17 +7,16 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""L3 create_buffer export handshake (P1-B 3c-2a).
+"""L3 create_buffer owner-side allocation (P1-B).
 
-``Worker.create_buffer`` allocates a born-shared BufferHandle and broadcasts its typed
-BufferHandleDescriptor to every forked child via ``_CTRL_REGISTER_HANDLE``; each child decodes it
-and registers ``canonical identity -> local base`` in its ImportRegistry. A create_buffer that
-returns without raising means the chip child successfully decoded the 216-byte descriptor and mapped
-the POSIX shm (a broadcast error would have propagated). This exercises the owner export + child
-import handshake end-to-end; wiring the handle into task dispatch (BufferRef) is 3c-2b.
+``Worker.create_buffer`` allocates a born-shared BufferHandle carrying a typed canonical identity.
+There is **no eager export handshake**: the handle's self-describing descriptor rides embedded in
+every BufferRef built over it, and a consumer materializes it lazily on first receipt. This test
+covers the owner-side contract — a live L3 Worker allocates handles that carry a stable identity, a
+monotonic buffer_id, and usable born-shared backing, and releases them cleanly on close.
 
-a2a3sim: create_buffer is pure host-side (POSIX shm + a control broadcast to the forked chip child),
-no platform branching. The vector callable exists only to give the L3 worker a chip child to fork.
+a2a3sim: create_buffer is pure host-side (POSIX shm), no platform branching. The vector callable
+exists only to give the L3 worker a chip child to fork (create_buffer requires one).
 """
 
 from simpler.buffer_handle import AddressSpace, BackendKind, Visibility
@@ -29,8 +28,8 @@ KERNELS_BASE = "../../../../examples/a2a3/tensormap_and_ringbuffer/vector_exampl
 
 
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
-class TestL3CreateBufferHandshake(SceneTestCase):
-    """create_buffer owner-export + child-import handshake on a single L3 worker."""
+class TestL3CreateBuffer(SceneTestCase):
+    """create_buffer owner-side allocation contract on a single L3 worker."""
 
     CALLABLE = {
         "callables": [
@@ -54,14 +53,12 @@ class TestL3CreateBufferHandshake(SceneTestCase):
     }
 
     CASES = [
-        {"name": "create_buffer_handshake", "platforms": ["a2a3sim"]},
+        {"name": "create_buffer_owner_contract", "platforms": ["a2a3sim"]},
     ]
 
     def test_run(self, st_worker):
         worker = st_worker
 
-        # Each create_buffer exports a descriptor to the forked chip child; a child-side decode or
-        # shm-map failure would surface here as a raised RuntimeError.
         h0 = worker.create_buffer(256)
         h1 = worker.create_buffer(512)
 

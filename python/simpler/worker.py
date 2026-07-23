@@ -98,7 +98,6 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
 from . import _log as _simpler_log
 from .buffer_handle import (
     BufferHandle,
-    ImportRegistry,
     create_host_shared_buffer,
     mint_owner_instance_id,
 )
@@ -296,10 +295,6 @@ _BLOB_TENSOR_STRIDE = 128
 _BLOB_HEADER_BYTES = 8
 _CTRL_L3_L2_REGION_CREATE = 16
 _CTRL_L3_L2_REGION_RELEASE = 17
-# Export a BufferHandle to every local child: the staged payload is a packed
-# BufferHandleDescriptor; the child decodes it and registers it in its ImportRegistry so a later
-# BufferRef referencing the handle's canonical identity resolves to a local base (P1-B 3c-2a).
-_CTRL_REGISTER_HANDLE = 18
 
 # Layout of the CTRL_COMM_INIT request shm.
 _COMM_INIT_HEADER = struct.Struct("<II")  # rank (u32), nranks (u32)
@@ -602,24 +597,6 @@ def _handle_ctrl_unmap_host(
     if entry is not None:
         entry[0].close()
         _rebuild_host_buf_ranges(host_buf_table, host_buf_ranges)
-
-
-def _handle_ctrl_register_handle(buf: memoryview, import_registry: ImportRegistry) -> None:
-    """Child handler for _CTRL_REGISTER_HANDLE: register an exported BufferHandleDescriptor.
-
-    The staged payload is a packed BufferHandleDescriptor. Registering it records the handle's
-    canonical identity -> local base in this child's ImportRegistry (the typed successor of
-    host_buf_table); a later BufferRef referencing that identity resolves without re-sending it.
-    """
-    payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
-    staged = SharedMemory(name=_read_ctrl_staged_shm_name(buf))
-    try:
-        staged_buf = staged.buf
-        assert staged_buf is not None
-        descriptor = bytes(staged_buf[:payload_size])
-    finally:
-        staged.close()
-    import_registry.register(descriptor)
 
 
 def _allocate_local_slot(registry: dict[int, Any]) -> int:
@@ -1016,7 +993,7 @@ def _read_args_from_mailbox(buf) -> TaskArgs:
     return read_args_from_blob(mailbox_addr + _OFF_TASK_ARGS_BLOB)
 
 
-def _sub_worker_loop(  # noqa: PLR0912 -- fork-child state machine: TASK/CONTROL/SHUTDOWN states x per-op control dispatch
+def _sub_worker_loop(
     buf,
     registry: dict[int, Any],
     identity_table: dict[bytes, int],
@@ -1032,7 +1009,6 @@ def _sub_worker_loop(  # noqa: PLR0912 -- fork-child state machine: TASK/CONTROL
     state_addr = _buffer_field_addr(buf, _OFF_STATE)
     host_buf_table: dict[int, tuple[SharedMemory, int, int, int]] = {}
     host_buf_ranges: list[tuple[int, int, int]] = []
-    import_registry = ImportRegistry()
     try:
         while True:
             state = _mailbox_load_i32(state_addr)
@@ -1065,8 +1041,6 @@ def _sub_worker_loop(  # noqa: PLR0912 -- fork-child state machine: TASK/CONTROL
                         _handle_ctrl_map_host(buf, host_buf_table, host_buf_ranges)
                     elif sub_cmd == _CTRL_UNMAP_HOST:
                         _handle_ctrl_unmap_host(buf, host_buf_table, host_buf_ranges)
-                    elif sub_cmd == _CTRL_REGISTER_HANDLE:
-                        _handle_ctrl_register_handle(buf, import_registry)
                     else:
                         _handle_py_callable_control(
                             buf,
@@ -1084,7 +1058,6 @@ def _sub_worker_loop(  # noqa: PLR0912 -- fork-child state machine: TASK/CONTROL
             elif state == _SHUTDOWN:
                 break
     finally:
-        import_registry.close()
         for host_shm, _lo, _hi, _base in host_buf_table.values():
             try:
                 host_shm.close()
@@ -1451,7 +1424,6 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     # rebuilt from the table on every map/unmap.
     host_buf_table: dict[int, tuple[SharedMemory, int, int, int]] = {}  # token -> (shm, lo, hi, child_base)
     host_buf_ranges: list[tuple[int, int, int]] = []  # (parent_lo, parent_hi, child_base)
-    import_registry = ImportRegistry()  # canonical identity -> local base (P1-B 3c-2a)
     try:
         while True:
             state = _mailbox_load_i32(state_addr)
@@ -1598,8 +1570,6 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                         _handle_ctrl_l3_l2_region_create(cw, buf, chip_platform, l3_l2_region_store)
                     elif sub_cmd == _CTRL_L3_L2_REGION_RELEASE:
                         _handle_ctrl_l3_l2_region_release(buf, l3_l2_region_store)
-                    elif sub_cmd == _CTRL_REGISTER_HANDLE:
-                        _handle_ctrl_register_handle(buf, import_registry)
                     else:
                         raise RuntimeError(f"unknown control sub-command {int(sub_cmd)}")
                 except Exception as e:  # noqa: BLE001
@@ -1614,7 +1584,6 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
             elif state == _SHUTDOWN:
                 break
     finally:
-        import_registry.close()
         _sweep_l2_host_l3_l2_regions(l3_l2_region_store)
         for host_shm, _lo, _hi, _base in host_buf_table.values():
             try:
@@ -2146,8 +2115,9 @@ class Worker:
         self._host_buf_snapshot: tuple[tuple[int, ...], dict[int, _HostBufEntry]] = ((), {})
         self._host_buf_token_counter: int = 0
         # Owner-side BufferHandle state (P1-B): a per-incarnation opaque nonce, a monotonic buffer_id
-        # (0 reserved), and the live handles this Worker owns. create_buffer allocates a handle and
-        # exports its descriptor to every local child via _CTRL_REGISTER_HANDLE.
+        # (0 reserved), and the live handles this Worker owns. create_buffer allocates a handle whose
+        # self-describing descriptor rides embedded in every BufferRef built over it (no export
+        # handshake); consumers materialize it lazily on receipt.
         self._owner_instance_id: bytes = mint_owner_instance_id()
         self._buffer_id_counter: int = 1
         self._buffer_handles: dict[int, BufferHandle] = {}
@@ -5355,13 +5325,14 @@ class Worker:
     # ------------------------------------------------------------------
 
     def create_buffer(self, nbytes: int) -> BufferHandle:
-        """Allocate a shared ``BufferHandle`` and export it to every local child (P1-B).
+        """Allocate a shared ``BufferHandle`` owned by this Worker (P1-B).
 
         Like ``create_host_buffer``, the backing is a born-shared POSIX shm attached into every
-        forked child; unlike it, the handle carries a typed canonical identity and its descriptor is
-        registered in each child's ``ImportRegistry`` (identity -> local base), the successor of the
-        numeric-range ``host_buf_table``. Build a tensor over ``handle.shm.buf`` with the buffer
-        protocol. Not thread-safe against a concurrent run/create/free on the same Worker.
+        forked child; unlike it, the handle carries a typed canonical identity and a self-describing
+        descriptor. No eager export handshake: the descriptor travels **embedded in every
+        ``BufferRef``** built over this handle, and a consumer materializes it lazily on first
+        receipt (map-once, keyed by canonical identity). Build a tensor over ``handle.shm.buf`` with
+        the buffer protocol. Not thread-safe against a concurrent run/create/free on the same Worker.
         """
         if self.level < 3:
             raise TypeError("create_buffer requires a level >= 3 Worker")
@@ -5383,19 +5354,8 @@ class Worker:
             owner_worker_path=f"L{self.level}",
             generation=1,
         )
-        try:
-            with self._registry_lock:
-                self._buffer_handles[buffer_id] = handle
-            errors = self._broadcast_host_control(_CTRL_REGISTER_HANDLE, handle.to_descriptor().pack())
-            if errors:
-                raise RuntimeError(
-                    f"create_buffer: REGISTER_HANDLE failed on {len(errors)} local children; first error: {errors[0]}"
-                )
-        except BaseException:
-            with self._registry_lock:
-                self._buffer_handles.pop(buffer_id, None)
-            handle.close()
-            raise
+        with self._registry_lock:
+            self._buffer_handles[buffer_id] = handle
         return handle
 
     def create_host_buffer(self, nbytes: int) -> HostBuffer:
@@ -5601,9 +5561,9 @@ class Worker:
     def _release_all_buffer_handles(self) -> None:
         """Close + unlink every owner BufferHandle (called from close()).
 
-        Children drop their own mappings when their loops exit (ImportRegistry.close); the owner
-        unlinks the backing shm here. Best-effort per handle; the first error is raised after all are
-        attempted so close() reports a leak rather than swallowing it.
+        Children drop their own lazily-mapped imports when their loops exit; the owner unlinks the
+        backing shm here. Best-effort per handle; the first error is raised after all are attempted so
+        close() reports a leak rather than swallowing it.
         """
         with self._registry_lock:
             handles = list(self._buffer_handles.values())
