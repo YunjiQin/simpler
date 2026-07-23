@@ -273,26 +273,6 @@ class BufferHandle:
             dtype=int(dtype),
         )
 
-    def ref_for_tensor(self, tensor) -> BufferRef:
-        """A BufferRef viewing a materialized ``Tensor`` arg over this handle.
-
-        The view geometry (``byte_offset``, ``shapes``, ``strides``, ``dtype``) is read from the
-        tensor; the backing is this handle. ``tensor.data`` must lie within this handle's backing.
-        This is the per-arg step of submit-layer auto-wrap once the owning handle is chosen.
-        """
-        byte_offset = int(tensor.data) - self.base
-        if byte_offset < 0 or byte_offset + int(tensor.nbytes()) > self.nbytes:
-            raise ValueError(
-                f"tensor view [{byte_offset}, {byte_offset + int(tensor.nbytes())}) lies outside "
-                f"the handle's backing (nbytes={self.nbytes})"
-            )
-        return self.ref(
-            shapes=tuple(tensor.shapes),
-            strides=tuple(tensor.strides),
-            dtype=int(tensor.dtype.value),
-            byte_offset=byte_offset,
-        )
-
     def close(self) -> None:
         if self.shm is not None:
             self.shm.close()
@@ -358,37 +338,6 @@ def wrap_fork_inherited(
         body=int(data_ptr).to_bytes(8, "little"),
         shm=None,
         base=int(data_ptr),
-    )
-
-
-def wrap_posix_shm(
-    shm_name: str,
-    base: int,
-    nbytes: int,
-    owner_instance_id: bytes,
-    buffer_id: int,
-    owner_worker_path: str = "",
-    generation: int = 0,
-    access: AccessMode = AccessMode.READWRITE,
-) -> BufferHandle:
-    """Wrap an **already-existing** POSIX shm (owned elsewhere, e.g. a ``create_host_buffer``) as a
-    ``POSIX_SHM`` ``BufferHandle`` carrying a canonical identity.
-
-    The returned handle does NOT own the shm: ``shm`` is None so ``close()`` is a no-op, and the
-    original allocator is responsible for unlinking it. Used by submit-layer auto-wrap to give an
-    existing shared buffer a typed identity + descriptor without re-creating it.
-    """
-    identity = CanonicalIdentity(owner_instance_id, buffer_id, owner_worker_path, generation)
-    return BufferHandle(
-        identity=identity,
-        address_space=AddressSpace.HOST,
-        visibility=Visibility.SHARED,
-        access=access,
-        backend_kind=BackendKind.POSIX_SHM,
-        nbytes=nbytes,
-        body=shm_name.encode("utf-8"),
-        shm=None,
-        base=base,
     )
 
 

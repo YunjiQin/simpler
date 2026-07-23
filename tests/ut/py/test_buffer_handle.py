@@ -17,7 +17,6 @@ from _task_interface import (
     OWNER_INSTANCE_ID_BYTES,
     PATH_MAX_BYTES,
     DataType,
-    Tensor,
     materialize_bufferref_blob,
     read_args_from_blob,
 )
@@ -152,25 +151,6 @@ def test_resolve_unregistered_raises():
     reg = ImportRegistry()
     with pytest.raises(KeyError):
         reg.resolve(_identity())
-
-
-def test_ref_for_tensor_view_geometry():
-    oid = mint_owner_instance_id()
-    h = create_host_shared_buffer(nbytes=256, owner_instance_id=oid, buffer_id=1)
-    try:
-        t = Tensor.make(h.base + 16, (2, 4), DataType.FLOAT32)
-        ref = h.ref_for_tensor(t)
-        assert ref.byte_offset == 16
-        assert ref.shapes == (2, 4)
-        assert ref.strides == (4, 1)
-        assert ref.dtype == DataType.FLOAT32.value
-        assert ref.handle == h.to_descriptor()
-        # a view spilling past the backing is rejected: 200 + 32*4 = 328 > 256
-        big = Tensor.make(h.base + 200, (32,), DataType.FLOAT32)
-        with pytest.raises(ValueError, match="outside"):
-            h.ref_for_tensor(big)
-    finally:
-        h.close()
 
 
 def test_fork_inherited_zero_copy_materialize():

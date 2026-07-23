@@ -100,3 +100,32 @@ def make_tensor_arg(tensor) -> Tensor:
         )
     shapes = tuple(int(s) for s in tensor.shape)
     return Tensor.make(tensor.data_ptr(), shapes, dt)
+
+
+def make_buffer_ref(handle, tensor):
+    """Build a ``BufferRef`` viewing ``tensor``'s memory over ``handle`` — the L3+ way to name a task
+    arg without a C++ ``Tensor``.
+
+    Geometry (shape/strides/dtype) is read from the torch tensor; the backing (identity + backend +
+    descriptor) is ``handle``. ``tensor.data_ptr()`` must lie within ``handle``'s backing;
+    ``byte_offset`` is its distance from ``handle.base``. The tensor must be contiguous CPU memory
+    (the L2 materialization path is row-major); a device tensor or a non-contiguous view raises.
+
+    Typical use: allocate a handle, build a torch view over it for compute, then name it for submit::
+
+        h = worker.create_buffer(n * 4)
+        t = torch.frombuffer(h.shm.buf, dtype=torch.float32, count=n)  # compute in place
+        args.add_ref(make_buffer_ref(h, t), ArgDirection.INPUT)
+    """
+    _ensure_torch_map()
+    dt = _TORCH_DTYPE_MAP.get(tensor.dtype)  # pyright: ignore[reportOptionalMemberAccess]
+    if dt is None:
+        raise ValueError(f"Unsupported tensor dtype for BufferRef: {tensor.dtype}")
+    if tensor.device.type != "cpu":
+        raise ValueError(f"make_buffer_ref requires a CPU tensor, got device={tensor.device}")
+    if not tensor.is_contiguous():
+        raise ValueError("make_buffer_ref requires a contiguous tensor; call tensor.contiguous() first")
+    byte_offset = tensor.data_ptr() - handle.base
+    shapes = tuple(int(s) for s in tensor.shape)
+    strides = tuple(int(s) for s in tensor.stride())
+    return handle.ref(shapes=shapes, strides=strides, dtype=dt.value, byte_offset=byte_offset)
