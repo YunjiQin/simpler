@@ -273,6 +273,26 @@ class BufferHandle:
             dtype=int(dtype),
         )
 
+    def ref_for_tensor(self, tensor) -> BufferRef:
+        """A BufferRef viewing a materialized ``Tensor`` arg over this handle.
+
+        The view geometry (``byte_offset``, ``shapes``, ``strides``, ``dtype``) is read from the
+        tensor; the backing is this handle. ``tensor.data`` must lie within this handle's backing.
+        This is the per-arg step of submit-layer auto-wrap once the owning handle is chosen.
+        """
+        byte_offset = int(tensor.data) - self.base
+        if byte_offset < 0 or byte_offset + int(tensor.nbytes()) > self.nbytes:
+            raise ValueError(
+                f"tensor view [{byte_offset}, {byte_offset + int(tensor.nbytes())}) lies outside "
+                f"the handle's backing (nbytes={self.nbytes})"
+            )
+        return self.ref(
+            shapes=tuple(tensor.shapes),
+            strides=tuple(tensor.strides),
+            dtype=int(tensor.dtype.value),
+            byte_offset=byte_offset,
+        )
+
     def close(self) -> None:
         if self.shm is not None:
             self.shm.close()
