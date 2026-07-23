@@ -147,7 +147,6 @@ from .task_interface import (
     RemoteAddressSpace,
     RemoteBufferExport,
     RemoteBufferHandle,
-    TaskArgs,
     Tensor,
     _Worker,
 )
@@ -975,24 +974,22 @@ def _format_exc(prefix: str, exc: BaseException) -> str:
     return f"{prefix}: {type(exc).__name__}: {exc}"
 
 
-def _read_args_from_mailbox(buf) -> TaskArgs:
-    """Decode the TaskArgs blob written by C++ write_blob from the mailbox.
+def _read_args_from_mailbox(buf, import_registry: ImportRegistry):
+    """Materialize the mailbox BufferRef args blob into a Tensor ``TensorTaskArgs`` for a Python callable.
 
-    Used by the Python-targeted child loops (sub_worker, nested L4+ child)
-    where the destination of `args` is a Python callable that needs a
-    typed TaskArgs object.  The chip-child loops that immediately forward
-    to C++ run use the zero-copy `run_from_blob` path
-    instead — see those loops for the matching comment.
-
-    Delegates to the nanobind helper so the Tensor layout is
-    parsed by C++ `read_blob` (single source of truth) instead of being
-    reimplemented in Python.  The Python re-implementation that lived
-    here previously dropped the `child_memory` byte (offset 33), which
-    silently broke any tensor carrying a chip-owned device pointer
-    (HCCL window slots etc.) — now structurally impossible.
+    Used by the Python-targeted child loops (sub_worker, nested L4+ child) where the destination of
+    ``args`` is a Python callable that needs a typed args object with Tensors. The mailbox carries a
+    BufferRef blob (the L3→L2 wire): resolve each ref's embedded handle to a local base (map-once via
+    ``import_registry``), build the Tensor blob at those bases, then decode it via C++ ``read_blob``
+    (single source of truth for the Tensor layout — the Python re-impl that once lived here dropped
+    the address-space byte, silently breaking device pointers). The chip-child loops forward the
+    materialized Tensor blob straight to ``run_from_blob`` instead of decoding a typed object.
     """
-    mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
-    return read_args_from_blob(mailbox_addr + _OFF_TASK_ARGS_BLOB)
+    args_ptr = _buffer_field_addr(buf, _OFF_TASK_ARGS_BLOB)
+    resolved = import_registry.materialize_blob(args_ptr, _MAILBOX_ARGS_CAPACITY)
+    tensor_blob = materialize_bufferref_blob(args_ptr, _MAILBOX_ARGS_CAPACITY, resolved)
+    scratch = ctypes.create_string_buffer(tensor_blob, len(tensor_blob))
+    return read_args_from_blob(ctypes.addressof(scratch))
 
 
 def _sub_worker_loop(
@@ -1011,6 +1008,7 @@ def _sub_worker_loop(
     state_addr = _buffer_field_addr(buf, _OFF_STATE)
     host_buf_table: dict[int, tuple[SharedMemory, int, int, int]] = {}
     host_buf_ranges: list[tuple[int, int, int]] = []
+    import_registry = ImportRegistry()  # lazy per-endpoint import cache: canonical identity -> local base
     try:
         while True:
             state = _mailbox_load_i32(state_addr)
@@ -1025,9 +1023,7 @@ def _sub_worker_loop(
                     msg = f"sub_worker: callable hash {_format_digest(digest)} not registered"
                 else:
                     try:
-                        if host_buf_ranges:
-                            _rewrite_blob_host_addrs(buf, _OFF_TASK_ARGS_BLOB, host_buf_ranges)
-                        args = _read_args_from_mailbox(buf)
+                        args = _read_args_from_mailbox(buf, import_registry)
                         fn(args)
                     except Exception as e:  # noqa: BLE001
                         code = 1
@@ -1060,6 +1056,7 @@ def _sub_worker_loop(
             elif state == _SHUTDOWN:
                 break
     finally:
+        import_registry.close()
         for host_shm, _lo, _hi, _base in host_buf_table.values():
             try:
                 host_shm.close()
@@ -1725,6 +1722,7 @@ def _child_worker_loop(
     into the inner Worker (see docs section 7).
     """
     state_addr = _buffer_field_addr(buf, _OFF_STATE)
+    import_registry = ImportRegistry()  # lazy per-endpoint import cache: canonical identity -> local base
     while True:
         state = _mailbox_load_i32(state_addr)
         if state == _TASK_READY:
@@ -1738,7 +1736,7 @@ def _child_worker_loop(
                 msg = f"child_worker: callable hash {_format_digest(digest)} not registered"
             else:
                 try:
-                    args = _read_args_from_mailbox(buf)
+                    args = _read_args_from_mailbox(buf, import_registry)
                     cfg = _read_config_from_mailbox(buf)
                     inner_worker.run(orch_fn, args, cfg)
                 except Exception as e:  # noqa: BLE001
@@ -1805,6 +1803,7 @@ def _child_worker_loop(
             _write_error(buf, code, msg)
             _mailbox_store_i32(state_addr, _CONTROL_DONE)
         elif state == _SHUTDOWN:
+            import_registry.close()
             inner_worker.close()
             break
 
