@@ -21,7 +21,7 @@ import ctypes
 import enum
 import os
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from multiprocessing.shared_memory import SharedMemory
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
@@ -35,7 +35,9 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAX_TENSOR_DIMS,
     OWNER_INSTANCE_ID_BYTES,
     PATH_MAX_BYTES,
+    DataType,
     bufferref_blob_descriptors,
+    get_element_size,
 )
 
 
@@ -176,12 +178,26 @@ _BUFFERREF_BLOB_HEADER = struct.Struct("<IiiI")
 assert _BUFFERREF_BLOB_HEADER.size == BUFFERREF_BLOB_HEADER_BYTES, "BufferRef blob header drift"
 
 
+def _row_major_strides(shapes: tuple[int, ...]) -> tuple[int, ...]:
+    """Contiguous (row-major) element strides for ``shapes``: strides[i] = prod(shapes[i+1:])."""
+    strides = [1] * len(shapes)
+    for i in range(len(shapes) - 2, -1, -1):
+        strides[i] = strides[i + 1] * shapes[i + 1]
+    return tuple(strides)
+
+
 @dataclass(frozen=True)
 class BufferRef:
     """The blob-carried wire element: a full embedded handle descriptor + a strided view onto it.
 
     Self-describing — the consumer materializes ``handle`` on first receipt (no prior handshake),
     keyed by ``handle.identity``. Carries no materialized address.
+
+    View algebra mirrors the C++ ``Tensor`` (``slice`` / ``transpose`` / ``permute`` / ``view`` /
+    ``reshape``): pure metadata rewrites of ``(byte_offset, shapes, strides)`` returning a new
+    ``BufferRef``. ``strides`` are ELEMENT strides (> 0); ``byte_offset`` is a BYTE offset. Matching
+    ``Tensor``: ``slice`` / ``transpose`` / ``permute`` / ``view`` work on any (incl. strided) view;
+    ``reshape`` requires a contiguous view (no allocating copy — reach contiguous first).
     """
 
     handle: BufferHandleDescriptor
@@ -202,6 +218,86 @@ class BufferRef:
         strides = list(self.strides) + [0] * (MAX_TENSOR_DIMS - ndims)
         tail = _BUFFER_REF_TAIL.pack(self.byte_offset, ndims, *shapes, *strides, self.dtype)
         return self.handle.pack() + tail
+
+    # --- view algebra (zero-copy metadata rewrites, mirroring Tensor) ------------------------------
+
+    @property
+    def ndims(self) -> int:
+        return len(self.shapes)
+
+    def numel(self) -> int:
+        n = 1
+        for s in self.shapes:
+            n *= s
+        return n
+
+    @property
+    def is_contiguous(self) -> bool:
+        return self.strides == _row_major_strides(self.shapes)
+
+    def _elem_bytes(self) -> int:
+        return get_element_size(DataType(self.dtype))
+
+    def slice(self, dim: int, start: int, end: int, step: int = 1) -> BufferRef:
+        """View ``[start, end)`` with positive ``step`` along ``dim``. Works on any (strided) view."""
+        if not 0 <= dim < self.ndims:
+            raise ValueError(f"slice dim {dim} out of range [0, {self.ndims})")
+        if step < 1:
+            raise ValueError(f"slice step must be >= 1, got {step}")
+        if not 0 <= start < end <= self.shapes[dim]:
+            raise ValueError(f"slice [{start}, {end}) out of range [0, {self.shapes[dim]}] on dim {dim}")
+        old_stride = self.strides[dim]
+        new_shapes = list(self.shapes)
+        new_strides = list(self.strides)
+        new_shapes[dim] = (end - start + step - 1) // step
+        new_strides[dim] = old_stride * step
+        byte_offset = self.byte_offset + start * old_stride * self._elem_bytes()
+        return replace(self, byte_offset=byte_offset, shapes=tuple(new_shapes), strides=tuple(new_strides))
+
+    def transpose(self, x: int, y: int) -> BufferRef:
+        """Swap dims ``x`` and ``y`` (shapes + strides). Works on any (strided) view."""
+        if not (0 <= x < self.ndims and 0 <= y < self.ndims):
+            raise ValueError(f"transpose dims ({x}, {y}) out of range [0, {self.ndims})")
+        new_shapes = list(self.shapes)
+        new_strides = list(self.strides)
+        new_shapes[x], new_shapes[y] = new_shapes[y], new_shapes[x]
+        new_strides[x], new_strides[y] = new_strides[y], new_strides[x]
+        return replace(self, shapes=tuple(new_shapes), strides=tuple(new_strides))
+
+    def permute(self, order: tuple[int, ...]) -> BufferRef:
+        """Reorder dims by ``order`` (a permutation of range(ndims)). Works on any (strided) view."""
+        if sorted(order) != list(range(self.ndims)):
+            raise ValueError(f"permute order {order} must be a permutation of range({self.ndims})")
+        new_shapes = tuple(self.shapes[o] for o in order)
+        new_strides = tuple(self.strides[o] for o in order)
+        return replace(self, shapes=new_shapes, strides=new_strides)
+
+    def view(self, view_shapes: tuple[int, ...], view_offsets: tuple[int, ...]) -> BufferRef:
+        """Sub-view: origin shifts by ``view_offsets`` (per dim), shape becomes ``view_shapes``,
+        strides unchanged. Each ``view_offsets[i] + view_shapes[i]`` must stay within ``shapes[i]``.
+        """
+        if len(view_shapes) != self.ndims or len(view_offsets) != self.ndims:
+            raise ValueError(f"view shapes/offsets must have ndims={self.ndims}")
+        elem = self._elem_bytes()
+        byte_offset = self.byte_offset
+        for i in range(self.ndims):
+            if view_offsets[i] + view_shapes[i] > self.shapes[i]:
+                raise ValueError(
+                    f"view dim {i}: offset {view_offsets[i]} + shape {view_shapes[i]} exceeds {self.shapes[i]}"
+                )
+            byte_offset += view_offsets[i] * self.strides[i] * elem
+        return replace(self, byte_offset=byte_offset, shapes=tuple(view_shapes))
+
+    def reshape(self, new_shapes: tuple[int, ...]) -> BufferRef:
+        """Contiguous-only reshape (mirrors Tensor::reshape's ``always_assert(is_contiguous)``)."""
+        if not self.is_contiguous:
+            raise ValueError("reshape requires a contiguous view; reach contiguous (via a copy) first")
+        n = 1
+        for s in new_shapes:
+            n *= s
+        if n != self.numel():
+            raise ValueError(f"reshape {new_shapes} (numel {n}) does not match current numel {self.numel()}")
+        return replace(self, shapes=tuple(new_shapes), strides=_row_major_strides(tuple(new_shapes)))
 
 
 def pack_bufferref_blob(refs: list[BufferRef], scalars: tuple[int, ...] = ()) -> bytes:
@@ -255,21 +351,24 @@ class BufferHandle:
     def ref(
         self,
         shapes: tuple[int, ...],
-        strides: tuple[int, ...],
         dtype: int,
+        strides: tuple[int, ...] | None = None,
         byte_offset: int = 0,
     ) -> BufferRef:
         """A self-describing BufferRef viewing this handle: embeds the full descriptor + the view.
 
-        The consumer materializes it with no prior handshake. ``strides`` are in elements, row-major,
-        strictly positive; ``byte_offset`` must be a multiple of the dtype size (checked at
-        materialization).
+        ``strides`` default to contiguous (row-major) — ``handle.ref(shape, dtype)`` names the whole
+        buffer as a contiguous view; pass explicit element strides for a strided view (or reach one
+        via the BufferRef view algebra). ``byte_offset`` must be a multiple of the dtype size (checked
+        at materialization).
         """
+        shapes = tuple(shapes)
+        strides = _row_major_strides(shapes) if strides is None else tuple(strides)
         return BufferRef(
             handle=self.to_descriptor(),
             byte_offset=byte_offset,
-            shapes=tuple(shapes),
-            strides=tuple(strides),
+            shapes=shapes,
+            strides=strides,
             dtype=int(dtype),
         )
 

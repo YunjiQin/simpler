@@ -153,6 +153,49 @@ def test_resolve_unregistered_raises():
         reg.resolve(_identity())
 
 
+def test_bufferref_view_algebra():
+    oid = mint_owner_instance_id()
+    h = create_host_shared_buffer(nbytes=1024, owner_instance_id=oid, buffer_id=1)
+    try:
+        # handle.ref(shape, dtype) is a contiguous full view (row-major strides).
+        v = h.ref(shapes=(4, 8), dtype=DataType.FLOAT32.value)
+        assert v.strides == (8, 1)
+        assert v.is_contiguous
+        assert v.numel() == 32
+        assert v.byte_offset == 0
+
+        # slice: inner-dim slice keeps the stride, shifts the byte_offset, breaks contiguity.
+        s = v.slice(1, 2, 6)
+        assert s.shapes == (4, 4)
+        assert s.strides == (8, 1)
+        assert s.byte_offset == 2 * 1 * 4
+        assert not s.is_contiguous
+        # slice with a step multiplies the stride.
+        s2 = v.slice(0, 0, 4, step=2)
+        assert s2.shapes == (2, 8)
+        assert s2.strides == (16, 1)
+
+        # transpose / permute: swap/reorder shapes+strides, unconstrained (strided ok).
+        t = v.transpose(0, 1)
+        assert t.shapes == (8, 4)
+        assert t.strides == (1, 8)
+        assert not t.is_contiguous
+        assert v.permute((1, 0)).strides == (1, 8)
+
+        # view: sub-region by per-dim offset, strides unchanged.
+        vv = v.view((2, 3), (1, 2))
+        assert vv.shapes == (2, 3)
+        assert vv.strides == (8, 1)
+        assert vv.byte_offset == (1 * 8 + 2 * 1) * 4
+
+        # reshape: contiguous only.
+        assert v.reshape((32,)).strides == (1,)
+        with pytest.raises(ValueError, match="contiguous"):
+            t.reshape((32,))
+    finally:
+        h.close()
+
+
 def test_fork_inherited_zero_copy_materialize():
     # A pre-fork COW-inherited allocation: the FORK_SHM body is the base VA, materialized in place
     # (no shm, no copy). In-process the VA is trivially valid.
