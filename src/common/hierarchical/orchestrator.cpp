@@ -550,11 +550,14 @@ void Orchestrator::infer_deps(
             }
             if (!has_key) {
                 if (r.handle.nbytes == 0) continue;  // placeholder / null ref — nothing to track
-                // Key a local BufferRef by its canonical identity (hashed) folded with byte_offset:
-                // two refs to the same buffer at the same origin collide (a dependency), mirroring the
-                // former exact-address match now that BufferRef carries identity, not an address.
+                // Key a local BufferRef by its canonical identity alone (buffer granularity) — the
+                // successor of the former buffer-address key now that BufferRef carries identity, not
+                // an address. Any two refs to the same buffer collide (a candidate dependency); the
+                // byte_offset/footprint overlap that would refine this to only *conflicting* sub-views
+                // is a future precision pass, not part of the key (folding it in would split
+                // same-buffer refs into distinct keys and miss real dependencies).
                 CanonicalIdentityHash idh;
-                uint64_t k = idh(r.handle.identity) ^ (r.byte_offset * 0x9e3779b97f4a7c15ULL);
+                uint64_t k = idh(r.handle.identity);
                 key = r.handle.address_space == static_cast<uint8_t>(AddressSpace::DEVICE) ?
                           TensorKey::local_child(k, worker_id) :
                           TensorKey::local_host(k);
