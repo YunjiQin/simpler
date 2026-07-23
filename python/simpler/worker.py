@@ -92,12 +92,14 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     _l3_host_mapped_region_import_sim,
     _mailbox_load_i32,
     _mailbox_store_i32,
+    materialize_bufferref_blob,
     read_args_from_blob,
 )
 
 from . import _log as _simpler_log
 from .buffer_handle import (
     BufferHandle,
+    ImportRegistry,
     create_host_shared_buffer,
     mint_owner_instance_id,
 )
@@ -1424,6 +1426,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     # rebuilt from the table on every map/unmap.
     host_buf_table: dict[int, tuple[SharedMemory, int, int, int]] = {}  # token -> (shm, lo, hi, child_base)
     host_buf_ranges: list[tuple[int, int, int]] = []  # (parent_lo, parent_hi, child_base)
+    import_registry = ImportRegistry()  # lazy per-endpoint import cache: canonical identity -> local base
     try:
         while True:
             state = _mailbox_load_i32(state_addr)
@@ -1447,17 +1450,15 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                             f"chip_process dev={device_id}: cid {cid} not prepared before TASK_READY "
                             f"(register via _CTRL_PREPARE first)"
                         )
-                    # Redirect any registered host pointer (a parent VA) in the
-                    # blob to this child's own mapping before the runtime reads it.
-                    # No-op when nothing is registered.
-                    if host_buf_ranges:
-                        _rewrite_blob_host_addrs(buf, _OFF_TASK_ARGS_BLOB, host_buf_ranges)
-                    # Hand the mailbox bytes straight to C++ (zero-copy zero-decode):
-                    # the blob layout is what `write_blob` already wrote, so re-parsing
-                    # it in Python is N×40B of avoidable work and a permanent
-                    # opportunity to drop a field.  C++ reinterpret_cast<ChipStorageTaskArgs*>
-                    # is the source of truth.
-                    cw._impl.run_from_blob(cid, mailbox_addr + _OFF_TASK_ARGS_BLOB, _MAILBOX_ARGS_CAPACITY, cfg)
+                    # Materialize the BufferRef args into a Tensor blob the runtime reads: resolve
+                    # each ref's embedded handle to a local base (map-once, cached by canonical
+                    # identity), then build the Tensor blob at those bases. Replaces the former
+                    # parent-VA range rewrite — identities resolve exactly, not by numeric range.
+                    args_ptr = mailbox_addr + _OFF_TASK_ARGS_BLOB
+                    resolved = import_registry.materialize_blob(args_ptr, _MAILBOX_ARGS_CAPACITY)
+                    tensor_blob = materialize_bufferref_blob(args_ptr, _MAILBOX_ARGS_CAPACITY, resolved)
+                    scratch = ctypes.create_string_buffer(tensor_blob, len(tensor_blob))
+                    cw._impl.run_from_blob(cid, ctypes.addressof(scratch), len(tensor_blob), cfg)
                 except Exception as e:  # noqa: BLE001
                     code = 1
                     msg = _format_exc(f"chip_process dev={device_id}", e)
@@ -1584,6 +1585,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
             elif state == _SHUTDOWN:
                 break
     finally:
+        import_registry.close()
         _sweep_l2_host_l3_l2_regions(l3_l2_region_store)
         for host_shm, _lo, _hi, _base in host_buf_table.values():
             try:

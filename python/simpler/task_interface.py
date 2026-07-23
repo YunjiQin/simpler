@@ -578,7 +578,7 @@ class _RemoteTaskArgsStorage:
     inline_payload: bytearray
 
 
-_TASK_ARGS_ADD_TENSOR = TaskArgs.add_tensor
+_TASK_ARGS_ADD_REF = TaskArgs.add_ref
 _TASK_ARGS_CLEAR = TaskArgs.clear
 _REMOTE_TASK_ARGS_STORAGE: weakref.WeakKeyDictionary[TaskArgs, _RemoteTaskArgsStorage] = weakref.WeakKeyDictionary()
 _REMOTE_TASK_ARGS_STORAGE_LOCK = threading.Lock()
@@ -621,18 +621,13 @@ def _storage_for_remote_task_args(args: TaskArgs) -> _RemoteTaskArgsStorage:
         return storage
 
 
-def _task_args_add_tensor(
-    self: TaskArgs, tensor: Tensor | RemoteTensorRef, tag: TensorArgType = TensorArgType.INPUT
-) -> None:
-    if isinstance(tensor, RemoteTensorRef):
-        storage = _storage_for_remote_task_args(self)
-        metadata = Tensor.make(0, tensor.shape, tensor.dtype)
-        _TASK_ARGS_ADD_TENSOR(self, metadata, tag)
-        storage.sidecars.append(_sidecar_from_ref(storage, tensor))
-        return
-    if not isinstance(tensor, Tensor):
-        raise TypeError("TaskArgs.add_tensor expects Tensor or RemoteTensorRef")
-    _TASK_ARGS_ADD_TENSOR(self, tensor, tag)
+def _task_args_add_ref(self: TaskArgs, ref, tag: TensorArgType = TensorArgType.INPUT) -> None:
+    """Add a BufferRef task arg. ``ref`` is a ``simpler.buffer_handle.BufferRef`` (packable) or its
+    packed bytes. RemoteTensorRef (remote sidecar) is not yet migrated to the BufferRef wire."""
+    if isinstance(ref, RemoteTensorRef):
+        raise NotImplementedError("remote RemoteTensorRef submit is not yet migrated to the BufferRef wire (P1-B B3)")
+    packed = ref.pack() if hasattr(ref, "pack") else ref
+    _TASK_ARGS_ADD_REF(self, packed, tag)
     with _REMOTE_TASK_ARGS_STORAGE_LOCK:
         storage = _REMOTE_TASK_ARGS_STORAGE.get(self)
         if storage is not None:
@@ -645,7 +640,7 @@ def _task_args_clear(self: TaskArgs) -> None:
         _REMOTE_TASK_ARGS_STORAGE.pop(self, None)
 
 
-TaskArgs.add_tensor = _task_args_add_tensor
+TaskArgs.add_ref = _task_args_add_ref
 TaskArgs.clear = _task_args_clear
 
 
