@@ -14,12 +14,13 @@ import pytest
 from _task_interface import (
     BUFFER_HANDLE_DESCRIPTOR_BYTES,
     CANONICAL_IDENTITY_BYTES,
+    OWNER_INSTANCE_ID_BYTES,
+    PATH_MAX_BYTES,
     DataType,
     materialize_bufferref_blob,
     read_args_from_blob,
 )
 from simpler.buffer_handle import (
-    BUFFER_REF_FLAG_MANUAL_DEP,
     AccessMode,
     AddressSpace,
     BackendKind,
@@ -33,29 +34,36 @@ from simpler.buffer_handle import (
     pack_bufferref_blob,
 )
 
+_OID = bytes(range(0xA0, 0xA0 + OWNER_INSTANCE_ID_BYTES))
 
-def _identity(oid=0xA1A2A3A4A5A6A7A8, buffer_id=7, path=(3, 5), generation=2):
+
+def _identity(oid=_OID, buffer_id=7, path="L4/L3[2]", generation=2):
     return CanonicalIdentity(oid, buffer_id, path, generation)
 
 
-def test_identity_roundtrip_various_depths():
-    for path in [(), (1,), (3, 5), (1, 2, 3, 4)]:
+def test_identity_roundtrip_various_paths():
+    for path in ["", "L4", "L4/L3[2]", "L4/L3[2]/L2[5]"]:
         ident = _identity(path=path)
         raw = ident.pack()
         assert len(raw) == CANONICAL_IDENTITY_BYTES
         assert CanonicalIdentity.unpack(raw) == ident
 
 
-def test_identity_depth_over_limit_rejected():
+def test_identity_rejects_bad_oid_width():
     with pytest.raises(ValueError):
-        CanonicalIdentity(1, 1, (0, 0, 0, 0, 0), 0)  # depth 5 > MAX_WORKER_PATH_DEPTH (4)
+        CanonicalIdentity(b"\x00" * 8, 1, "L4", 0)  # 8 != OWNER_INSTANCE_ID_BYTES
+
+
+def test_identity_path_over_limit_rejected():
+    with pytest.raises(ValueError):
+        CanonicalIdentity(_OID, 1, "x" * (PATH_MAX_BYTES + 1), 0)
 
 
 def test_identity_distinguishes_generation_owner_path():
     a = _identity()
     assert a != _identity(generation=a.generation + 1)  # ABA
-    assert a != _identity(oid=a.owner_instance_id + 1)  # different incarnation
-    assert a != _identity(path=(3, 6))  # different path
+    assert a != _identity(oid=bytes(range(1, 1 + OWNER_INSTANCE_ID_BYTES)))  # different incarnation
+    assert a != _identity(path="L4/L3[3]")  # different path
 
 
 def test_descriptor_roundtrip_host_and_device():
@@ -66,7 +74,7 @@ def test_descriptor_roundtrip_host_and_device():
         access=AccessMode.READWRITE,
         backend_kind=BackendKind.POSIX_SHM,
         nbytes=4096,
-        token="psm_deadbeef",
+        body=b"psm_deadbeef",
     )
     raw = host.pack()
     assert len(raw) == BUFFER_HANDLE_DESCRIPTOR_BYTES
@@ -79,7 +87,7 @@ def test_descriptor_roundtrip_host_and_device():
         access=AccessMode.READ,
         backend_kind=BackendKind.VMM_WINDOW,
         nbytes=1 << 20,
-        backend_handle=0x7F00ABCD,
+        body=(0x7F00ABCD).to_bytes(8, "little"),
     )
     assert BufferHandleDescriptor.unpack(dev.pack()) == dev
 
@@ -95,13 +103,13 @@ def test_descriptor_rejects_unknown_version():
             nbytes=8,
         ).pack()
     )
-    raw[0] = raw[0] + 1  # bump abi_version (offset 0)
+    raw[0] = raw[0] + 1  # bump abi_version (u16 @ offset 0)
     with pytest.raises(ValueError, match="abi_version"):
         BufferHandleDescriptor.unpack(bytes(raw))
 
 
-def test_descriptor_rejects_oversized_token():
-    with pytest.raises(ValueError, match="token"):
+def test_descriptor_rejects_oversized_body():
+    with pytest.raises(ValueError, match="body"):
         BufferHandleDescriptor(
             identity=_identity(),
             address_space=AddressSpace.HOST,
@@ -109,22 +117,19 @@ def test_descriptor_rejects_oversized_token():
             access=AccessMode.READWRITE,
             backend_kind=BackendKind.POSIX_SHM,
             nbytes=8,
-            token="x" * 64,  # >= BACKEND_TOKEN_BYTES
+            body=b"x" * 200,  # > DESC_MAX_BYTES
         ).pack()
 
 
 def test_create_export_import_resolve_zero_copy():
     oid = mint_owner_instance_id()
-    handle = create_host_shared_buffer(nbytes=256, owner_instance_id=oid, buffer_id=1, owner_worker_path=(0,))
+    handle = create_host_shared_buffer(nbytes=256, owner_instance_id=oid, buffer_id=1, owner_worker_path="L4")
     reg = ImportRegistry()
     try:
         assert handle.backend_kind == BackendKind.POSIX_SHM
         imported = reg.register(handle.to_descriptor().pack())
-        # Same identity resolves to the imported mapping.
         assert reg.resolve(handle.identity).base == imported.base
         assert imported.nbytes == 256
-        # Zero-copy: owner and consumer map the same physical shm — a write on one side is visible
-        # on the other even though the base VAs differ (independent mappings of one POSIX shm).
         owner_shm = handle.shm
         consumer_shm = imported.shm
         assert owner_shm is not None
@@ -162,28 +167,21 @@ def test_register_remote_sidecar_rejected():
 
 def test_owner_instance_ids_are_distinct():
     ids = {mint_owner_instance_id() for _ in range(64)}
-    assert len(ids) == 64  # 64-bit nonce, collisions astronomically unlikely
+    assert len(ids) == 64
+    assert all(len(i) == OWNER_INSTANCE_ID_BYTES for i in ids)
 
 
 def test_materialize_bufferref_blob_to_tensors():
     oid = mint_owner_instance_id()
-    h_host = create_host_shared_buffer(nbytes=64, owner_instance_id=oid, buffer_id=1)
-    h_dev = create_host_shared_buffer(nbytes=128, owner_instance_id=oid, buffer_id=2, generation=3)
+    h0 = create_host_shared_buffer(nbytes=64, owner_instance_id=oid, buffer_id=1)
+    h1 = create_host_shared_buffer(nbytes=128, owner_instance_id=oid, buffer_id=2, generation=3)
     reg = ImportRegistry()
     try:
-        reg.register(h_host.to_descriptor().pack())
-        reg.register(h_dev.to_descriptor().pack())
+        reg.register(h0.to_descriptor().pack())
+        reg.register(h1.to_descriptor().pack())
 
-        # A BufferRef blob referencing both handles (contiguous views) plus a scalar.
-        ref0 = BufferRef(h_host.identity, byte_offset=0, shapes=(4,), strides=(1,), dtype=DataType.FLOAT32.value)
-        ref1 = BufferRef(
-            h_dev.identity,
-            byte_offset=8,
-            shapes=(2, 4),
-            strides=(4, 1),
-            dtype=DataType.FLOAT16.value,
-            flags=BUFFER_REF_FLAG_MANUAL_DEP,
-        )
+        ref0 = BufferRef(h0.identity, byte_offset=0, shapes=(4,), strides=(1,), dtype=DataType.FLOAT32.value)
+        ref1 = BufferRef(h1.identity, byte_offset=8, shapes=(2, 4), strides=(4, 1), dtype=DataType.FLOAT16.value)
         blob = pack_bufferref_blob([ref0, ref1], scalars=(42,))
         src = ctypes.create_string_buffer(blob, len(blob))
 
@@ -193,17 +191,16 @@ def test_materialize_bufferref_blob_to_tensors():
 
         assert args.tensor_count() == 2
         assert args.scalar_count() == 1
-        # Each tensor resolves to its handle's local base + byte_offset, with the ref's view.
-        assert args.tensor(0).data == reg.resolve(h_host.identity).base + 0
+        assert args.tensor(0).data == reg.resolve(h0.identity).base + 0
         assert args.tensor(0).shapes == (4,)
         assert args.tensor(0).child_memory is False  # HOST
-        assert args.tensor(1).data == reg.resolve(h_dev.identity).base + 8
+        assert args.tensor(1).data == reg.resolve(h1.identity).base + 8
         assert args.tensor(1).shapes == (2, 4)
         assert args.scalar(0) == 42
     finally:
         reg.close()
-        h_host.close()
-        h_dev.close()
+        h0.close()
+        h1.close()
 
 
 def test_materialize_rejects_unregistered_identity():

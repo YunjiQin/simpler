@@ -605,14 +605,15 @@ NB_MODULE(_task_interface, m) {
 
     // BufferHandle / BufferRef wire ABI (buffer_handle.h). Exported so the Python mirror in
     // simpler.buffer_handle can pin its struct formats to the C++ layout and reject drift.
-    m.attr("BUFFER_ABI_VERSION") = static_cast<uint32_t>(BUFFER_ABI_VERSION);
+    m.attr("BUFFER_ABI_VERSION") = static_cast<int>(BUFFER_ABI_VERSION);
+    m.attr("BUFFER_DESCRIPTOR_VERSION") = static_cast<int>(BUFFER_DESCRIPTOR_VERSION);
     m.attr("MAX_TENSOR_DIMS") = static_cast<int>(MAX_TENSOR_DIMS);
     m.attr("BUFFER_REF_BYTES") = static_cast<int>(sizeof(BufferRef));
     m.attr("BUFFER_HANDLE_DESCRIPTOR_BYTES") = static_cast<int>(sizeof(BufferHandleDescriptor));
     m.attr("CANONICAL_IDENTITY_BYTES") = static_cast<int>(sizeof(CanonicalIdentity));
-    m.attr("OWNER_WORKER_PATH_BYTES") = static_cast<int>(sizeof(OwnerWorkerPath));
-    m.attr("MAX_WORKER_PATH_DEPTH") = static_cast<int>(MAX_WORKER_PATH_DEPTH);
-    m.attr("BACKEND_TOKEN_BYTES") = static_cast<int>(BACKEND_TOKEN_BYTES);
+    m.attr("OWNER_INSTANCE_ID_BYTES") = static_cast<int>(OWNER_INSTANCE_ID_BYTES);
+    m.attr("PATH_MAX_BYTES") = static_cast<int>(PATH_MAX_BYTES);
+    m.attr("DESC_MAX_BYTES") = static_cast<int>(DESC_MAX_BYTES);
     m.attr("BUFFERREF_BLOB_HEADER_BYTES") = static_cast<int>(BUFFERREF_BLOB_HEADER_SIZE);
 
     // --- Tensor ---
@@ -1580,8 +1581,7 @@ NB_MODULE(_task_interface, m) {
                 auto addr_space = nb::cast<int>(val[1]);
                 Tensor t = make_tensor_external(
                     reinterpret_cast<void *>(static_cast<uintptr_t>(base + r.byte_offset)), r.shapes, r.ndims, r.dtype,
-                    /*manual_dep=*/(r.flags & BUFFER_REF_MANUAL_DEP) != 0, /*version=*/0,
-                    static_cast<AddressSpace>(addr_space)
+                    /*manual_dep=*/false, /*version=*/0, static_cast<AddressSpace>(addr_space)
                 );
                 args.add_tensor(t, TensorArgType::INPUT);
             }

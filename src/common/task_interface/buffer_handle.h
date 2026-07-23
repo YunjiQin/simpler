@@ -13,39 +13,48 @@
 /**
  * BufferHandle / BufferRef ABI — typed, versioned, opaque cross-layer buffer identity.
  *
- * Three types (see .docs/L3/P1-B-buffer-handle-abi.md):
+ * Layout implements the frozen logical schema in
+ * .docs/L3-new/worker-memory-model/bufferhandle-abi.md (that doc is authoritative for field set /
+ * widths / enum values / endianness / evolution; exact byte offsets here are this P1 wire's choice).
+ *
+ * Three types:
  *   - BufferHandleDescriptor : the owner's exported wire descriptor, sent once per edge in the
  *                              export/import handshake and registered into the consumer's import
- *                              registry. Carries the handle's backing properties (address space,
- *                              visibility, access, nbytes, backend). Version-prefixed: abi_version
- *                              leads so a decoder rejects an unknown version before trusting the rest.
+ *                              registry. Carries backing properties + a versioned length-delimited
+ *                              backend body. abi_version (u16) leads so a decoder rejects an unknown
+ *                              version before trusting the rest.
  *   - BufferRef              : the blob-carried view. Holds only the canonical identity (a reference
- *                              to a handle) plus a view (byte_offset, shape, strides, dtype). Carries
- *                              NO materialized address and NO copy of handle properties — the consumer
- *                              resolves those from its import registry by canonical identity.
+ *                              to a handle) plus a view (byte_offset, shape, strides, dtype). No
+ *                              materialized address, no copy of handle properties.
  *   - CanonicalIdentity      : owner_instance_id + owner_worker_path + buffer_id + generation. The
  *                              key both the owner registry and every consumer import registry use.
  *
- * Every field width, enum value, and offset below is wire ABI: pinned by static_assert and versioned
- * by BUFFER_ABI_VERSION. Unknown version / backend / non-zero reserved is rejected, never
- * silently accepted.
+ * Endianness: all multi-byte integers little-endian. owner_instance_id is an opaque byte sequence
+ * (bytewise-compared, no integer/endianness meaning). Unknown version / backend / descriptor_version
+ * is rejected, never silently accepted.
  */
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <type_traits>
 
 #include "data_type.h"
 
-// Wire version. A decoder rejects an unknown abi_version rather than misreading a future layout.
-inline constexpr uint32_t BUFFER_ABI_VERSION = 1u;
+// Wire version of the handle schema (u16). A decoder rejects an unknown abi_version rather than
+// misreading a future layout. 0 is reserved (illegal).
+inline constexpr uint16_t BUFFER_ABI_VERSION = 1;
 
-// owner_worker_path bound. Current L4 topology is depth 3 (L4/L3/L2 = at most 2 hops from root);
-// 4 leaves one level of headroom. Frozen: P2 must not extend the handle header.
-inline constexpr uint32_t MAX_WORKER_PATH_DEPTH = 4;
+// Version of a backend_descriptor body. Unknown descriptor_version is rejected like abi_version.
+inline constexpr uint8_t BUFFER_DESCRIPTOR_VERSION = 1;
 
-// Bounded, NUL-terminated backend token (POSIX/fork shm name). POSIX shm names are far shorter.
-inline constexpr uint32_t BACKEND_TOKEN_BYTES = 64;
+// owner_instance_id is a fixed-width opaque nonce (compared bytewise; no integer/endianness meaning).
+inline constexpr uint32_t OWNER_INSTANCE_ID_BYTES = 16;
+
+// Bounded length-delimited limits (single constants; revisit before the final ABI freeze).
+// owner_worker_path is a UTF-8 tree path like "L4/L3[2]/L2[5]"; backend body is per-backend.
+inline constexpr uint32_t PATH_MAX_BYTES = 64;
+inline constexpr uint32_t DESC_MAX_BYTES = 96;
 
 // AddressSpace (HOST/DEVICE) is shared with Tensor and lives in data_type.h.
 
@@ -65,80 +74,63 @@ enum class AccessMode : uint8_t {
 
 // Materialization backend of a handle. The consumer resolves a BufferRef to a local address via the
 // import registry keyed by canonical identity; this tag selects how. REMOTE_SIDECAR is reserved for
-// P2 and rejected on decode in P1. INVALID (0) is the zero-value sentinel, never a valid backing.
+// P2 and rejected on decode in P1. Values are frozen; 5.. reserved (unknown tag => reject).
 enum class BackendKind : uint8_t {
-    INVALID = 0,
-    FORK_SHM = 1,
-    POSIX_SHM = 2,
-    VMM_WINDOW = 3,
+    FORK_SHM = 0,
+    POSIX_SHM = 1,
+    VMM_WINDOW = 2,
+    REMOTE_SIDECAR = 3,
     DEVICE_MALLOC = 4,
-    REMOTE_SIDECAR = 5,
-};
-
-// BufferRef.flags bitmask (bitwise use — plain enum per codestyle).
-enum BufferRefFlag : uint8_t {
-    BUFFER_REF_MANUAL_DEP = 1u << 0,
-    BUFFER_REF_CONTIGUOUS = 1u << 1,
 };
 
 /**
- * Owner's position in the worker tree: `depth` hops from root, `hop[i]` the child index at hop i.
- * depth == 0 is root. Bytes beyond `depth` and the padding are reserved and must be zero.
- */
-struct OwnerWorkerPath {
-    uint8_t depth;
-    uint8_t _reserved[3];
-    uint32_t hop[MAX_WORKER_PATH_DEPTH];
-};
-
-static_assert(std::is_trivially_copyable_v<OwnerWorkerPath>, "OwnerWorkerPath must be trivially copyable for wire");
-static_assert(sizeof(OwnerWorkerPath) == 20, "OwnerWorkerPath is wire ABI (4 + 4*MAX_WORKER_PATH_DEPTH)");
-static_assert(offsetof(OwnerWorkerPath, hop) == 4);
-
-/**
- * Canonical allocation identity — globally unique across owner incarnations. `buffer_id` is unique
- * only within one owner incarnation; `owner_instance_id` (a per-incarnation nonce) and
- * `owner_worker_path` disambiguate it, and `generation` detects buffer_id reuse (ABA). The key of
- * both the owner registry and every consumer import registry.
+ * Canonical allocation identity — globally unique across owner incarnations, unchanged across every
+ * edge. `buffer_id` is unique only within one owner incarnation; `owner_instance_id` (a 16-byte
+ * per-incarnation nonce) and `owner_worker_path` disambiguate it, and `generation` detects buffer_id
+ * reuse (ABA). The key of both the owner registry and every consumer import registry.
+ *
+ * `owner_worker_path` is a bounded length-delimited UTF-8 tree path ("L4/L3[2]/L2[5]"): `path_len`
+ * valid bytes in `owner_worker_path[0, path_len)`; bytes beyond `path_len` and `_pad` are zero.
  */
 struct CanonicalIdentity {
-    uint64_t owner_instance_id;
+    uint8_t owner_instance_id[OWNER_INSTANCE_ID_BYTES];
     uint64_t buffer_id;
-    OwnerWorkerPath owner_worker_path;
     uint32_t generation;
+    uint16_t path_len;
+    uint8_t _pad[2];
+    char owner_worker_path[PATH_MAX_BYTES];
 };
 
 static_assert(std::is_trivially_copyable_v<CanonicalIdentity>);
-static_assert(sizeof(CanonicalIdentity) == 40, "CanonicalIdentity is wire ABI");
+static_assert(sizeof(CanonicalIdentity) == 96, "CanonicalIdentity is wire ABI");
 static_assert(offsetof(CanonicalIdentity, owner_instance_id) == 0);
-static_assert(offsetof(CanonicalIdentity, buffer_id) == 8);
-static_assert(offsetof(CanonicalIdentity, owner_worker_path) == 16);
-static_assert(offsetof(CanonicalIdentity, generation) == 36);
+static_assert(offsetof(CanonicalIdentity, buffer_id) == 16);
+static_assert(offsetof(CanonicalIdentity, generation) == 24);
+static_assert(offsetof(CanonicalIdentity, path_len) == 28);
+static_assert(offsetof(CanonicalIdentity, owner_worker_path) == 32);
 
 inline bool operator==(const CanonicalIdentity &a, const CanonicalIdentity &b) {
-    return a.owner_instance_id == b.owner_instance_id && a.buffer_id == b.buffer_id && a.generation == b.generation &&
-           a.owner_worker_path.depth == b.owner_worker_path.depth &&
-           a.owner_worker_path.hop[0] == b.owner_worker_path.hop[0] &&
-           a.owner_worker_path.hop[1] == b.owner_worker_path.hop[1] &&
-           a.owner_worker_path.hop[2] == b.owner_worker_path.hop[2] &&
-           a.owner_worker_path.hop[3] == b.owner_worker_path.hop[3];
+    return a.buffer_id == b.buffer_id && a.generation == b.generation && a.path_len == b.path_len &&
+           std::memcmp(a.owner_instance_id, b.owner_instance_id, OWNER_INSTANCE_ID_BYTES) == 0 &&
+           std::memcmp(a.owner_worker_path, b.owner_worker_path, a.path_len) == 0;
 }
 inline bool operator!=(const CanonicalIdentity &a, const CanonicalIdentity &b) { return !(a == b); }
 
-// Hash for use as an unordered_map key (consumer import registry). Mixes the identity's integer
-// fields; the path's reserved bytes are intentionally excluded so padding never perturbs the hash.
+// Hash for use as an unordered_map key (consumer import registry). Folds the significant identity
+// bytes; unused path bytes past path_len are excluded so they never perturb the hash.
 struct CanonicalIdentityHash {
     size_t operator()(const CanonicalIdentity &k) const {
         auto mix = [](size_t h, uint64_t v) {
             return (h ^ (v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2)));
         };
         size_t h = 0;
-        h = mix(h, k.owner_instance_id);
+        for (uint32_t i = 0; i < OWNER_INSTANCE_ID_BYTES; ++i)
+            h = mix(h, k.owner_instance_id[i]);
         h = mix(h, k.buffer_id);
         h = mix(h, k.generation);
-        h = mix(h, k.owner_worker_path.depth);
-        for (uint32_t i = 0; i < MAX_WORKER_PATH_DEPTH; ++i)
-            h = mix(h, k.owner_worker_path.hop[i]);
+        h = mix(h, k.path_len);
+        for (uint16_t i = 0; i < k.path_len; ++i)
+            h = mix(h, static_cast<uint8_t>(k.owner_worker_path[i]));
         return h;
     }
 };
@@ -150,11 +142,10 @@ struct CanonicalIdentityHash {
  *   - Carries NO materialized address. The consumer resolves the canonical identity against its
  *     import registry to a local base, then `Tensor.buffer.addr = base`,
  *     `Tensor.start_offset = byte_offset / dtype_bytes`.
- *   - `byte_offset` is a BYTE offset of the view origin and must be a multiple of the dtype size
- *     (validated at materialization; non-aligned byte-views are not supported in this ABI version).
+ *   - `byte_offset` is a BYTE offset of the view origin; a multiple of the dtype size (validated at
+ *     materialization).
  *   - `strides[i] > 0` strictly (broadcast / negative step unsupported), carried explicitly — a
  *     singleton dimension's stride is never normalized away.
- *   - `reserved` must be zero; a non-zero reserved is rejected on decode.
  */
 struct BufferRef {
     CanonicalIdentity identity;
@@ -163,50 +154,51 @@ struct BufferRef {
     uint32_t shapes[MAX_TENSOR_DIMS];
     uint32_t strides[MAX_TENSOR_DIMS];
     DataType dtype;
-    uint8_t flags;
-    uint8_t reserved[2];
+    uint8_t _pad[3];
 };
 
 static_assert(std::is_trivially_copyable_v<BufferRef>, "BufferRef must be trivially copyable for blob memcpy");
-static_assert(sizeof(BufferRef) == 96, "BufferRef is wire ABI");
+static_assert(sizeof(BufferRef) == 152, "BufferRef is wire ABI");
 static_assert(offsetof(BufferRef, identity) == 0);
-static_assert(offsetof(BufferRef, byte_offset) == 40);
-static_assert(offsetof(BufferRef, ndims) == 48);
-static_assert(offsetof(BufferRef, shapes) == 52);
-static_assert(offsetof(BufferRef, strides) == 72);
-static_assert(offsetof(BufferRef, dtype) == 92);
-static_assert(offsetof(BufferRef, flags) == 93);
+static_assert(offsetof(BufferRef, byte_offset) == 96);
+static_assert(offsetof(BufferRef, ndims) == 104);
+static_assert(offsetof(BufferRef, shapes) == 108);
+static_assert(offsetof(BufferRef, strides) == 128);
+static_assert(offsetof(BufferRef, dtype) == 148);
 
 /**
  * The owner's exported handle descriptor — the export/import handshake payload. Registered once per
- * edge into the consumer's import registry, keyed by canonical identity, valued by the local
- * materialization the consumer derives from `backend_kind` + `token`/`backend_handle`.
- *
- * Version-prefixed: `abi_version` leads so a decoder rejects an unknown version before trusting the
- * rest. `token` is a NUL-terminated shm name for FORK_SHM/POSIX_SHM ("" else); `backend_handle` is a
- * VMM shareable-handle / device pointer for VMM_WINDOW/DEVICE_MALLOC (0 else). Adding a field is an
- * abi_version bump (no reserved slot).
+ * edge into the consumer's import registry, keyed by canonical identity. `backend_kind` +
+ * `descriptor_version` + `body[0, body_len)` carry the per-backend materialization (POSIX/fork shm
+ * name, VMM shareable-handle, device VA, ...). Version-prefixed (`abi_version` u16 leads); unknown
+ * abi_version / backend_kind / descriptor_version is rejected before trusting the rest.
+ * `address_space` / `visibility` / `access` / `backend_kind` are raw u8 so an unknown value can be
+ * rejected without invoking undefined enum behavior.
  */
 struct BufferHandleDescriptor {
-    uint32_t abi_version;
-    AddressSpace address_space;
-    Visibility visibility;
-    AccessMode access;
-    BackendKind backend_kind;
+    uint16_t abi_version;
+    uint8_t address_space;
+    uint8_t visibility;
+    uint8_t access;
+    uint8_t backend_kind;
+    uint8_t descriptor_version;
+    uint8_t _pad0;
     CanonicalIdentity identity;
     uint64_t nbytes;
-    uint64_t backend_handle;
-    char token[BACKEND_TOKEN_BYTES];
+    uint16_t body_len;
+    uint8_t _pad1[6];
+    char body[DESC_MAX_BYTES];
 };
 
 static_assert(std::is_trivially_copyable_v<BufferHandleDescriptor>);
-static_assert(sizeof(BufferHandleDescriptor) == 128, "BufferHandleDescriptor is wire ABI");
+static_assert(sizeof(BufferHandleDescriptor) == 216, "BufferHandleDescriptor is wire ABI");
 static_assert(offsetof(BufferHandleDescriptor, abi_version) == 0);
-static_assert(offsetof(BufferHandleDescriptor, address_space) == 4);
-static_assert(offsetof(BufferHandleDescriptor, visibility) == 5);
-static_assert(offsetof(BufferHandleDescriptor, access) == 6);
-static_assert(offsetof(BufferHandleDescriptor, backend_kind) == 7);
+static_assert(offsetof(BufferHandleDescriptor, address_space) == 2);
+static_assert(offsetof(BufferHandleDescriptor, visibility) == 3);
+static_assert(offsetof(BufferHandleDescriptor, access) == 4);
+static_assert(offsetof(BufferHandleDescriptor, backend_kind) == 5);
+static_assert(offsetof(BufferHandleDescriptor, descriptor_version) == 6);
 static_assert(offsetof(BufferHandleDescriptor, identity) == 8);
-static_assert(offsetof(BufferHandleDescriptor, nbytes) == 48);
-static_assert(offsetof(BufferHandleDescriptor, backend_handle) == 56);
-static_assert(offsetof(BufferHandleDescriptor, token) == 64);
+static_assert(offsetof(BufferHandleDescriptor, nbytes) == 104);
+static_assert(offsetof(BufferHandleDescriptor, body_len) == 112);
+static_assert(offsetof(BufferHandleDescriptor, body) == 120);

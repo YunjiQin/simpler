@@ -6,17 +6,13 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Owner/consumer side of the P1-B BufferHandle ABI (Python mirror of ``buffer_handle.h``).
+"""Owner/consumer side of the BufferHandle ABI (Python mirror of ``buffer_handle.h``).
 
-A ``BufferHandle`` is the owner's registry object for one shared backing (identity + backend + the
-POSIX shm that backs it). ``create_host_shared_buffer`` mints one; ``BufferHandle.to_descriptor``
-serializes the wire ``BufferHandleDescriptor`` sent once per edge in the export handshake. An
-``ImportRegistry`` on the consumer side maps a descriptor into this process and resolves a
-``CanonicalIdentity`` to a local base address — the typed successor of ``host_buf_table`` /
-``_rewrite_blob_host_addrs``.
-
-Struct formats mirror ``buffer_handle.h`` byte for byte; their sizes are asserted at import against
-the constants the ``_task_interface`` binding exports, so a layout drift fails loudly here.
+Implements the frozen logical schema in ``.docs/L3-new/worker-memory-model/bufferhandle-abi.md``:
+16-byte opaque ``owner_instance_id``, length-delimited UTF-8 ``owner_worker_path`` ("L4/L3[2]/L2[5]"),
+and a versioned length-delimited ``backend`` body. Struct formats mirror ``buffer_handle.h`` byte for
+byte; their sizes are asserted at import against the constants the ``_task_interface`` binding
+exports, so a layout drift fails loudly here.
 """
 
 from __future__ import annotations
@@ -29,15 +25,16 @@ from dataclasses import dataclass
 from multiprocessing.shared_memory import SharedMemory
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
-    BACKEND_TOKEN_BYTES,
     BUFFER_ABI_VERSION,
+    BUFFER_DESCRIPTOR_VERSION,
     BUFFER_HANDLE_DESCRIPTOR_BYTES,
     BUFFER_REF_BYTES,
     BUFFERREF_BLOB_HEADER_BYTES,
     CANONICAL_IDENTITY_BYTES,
+    DESC_MAX_BYTES,
     MAX_TENSOR_DIMS,
-    MAX_WORKER_PATH_DEPTH,
-    OWNER_WORKER_PATH_BYTES,
+    OWNER_INSTANCE_ID_BYTES,
+    PATH_MAX_BYTES,
 )
 
 
@@ -58,27 +55,25 @@ class AccessMode(enum.IntEnum):
 
 
 class BackendKind(enum.IntEnum):
-    INVALID = 0
-    FORK_SHM = 1
-    POSIX_SHM = 2
-    VMM_WINDOW = 3
+    FORK_SHM = 0
+    POSIX_SHM = 1
+    VMM_WINDOW = 2
+    REMOTE_SIDECAR = 3
     DEVICE_MALLOC = 4
-    REMOTE_SIDECAR = 5
 
 
 # ---------------------------------------------------------------------------
 # Wire struct formats — mirror buffer_handle.h; sizes pinned to the binding.
 # ---------------------------------------------------------------------------
 #
-# CanonicalIdentity (40 B): owner_instance_id u64, buffer_id u64,
-#   owner_worker_path{ depth u8, _reserved[3], hop[MAX_WORKER_PATH_DEPTH] u32 }, generation u32.
-_CANONICAL_IDENTITY = struct.Struct(f"<QQB3x{MAX_WORKER_PATH_DEPTH}II")
-# BufferHandleDescriptor (128 B) = prefix(8) + CanonicalIdentity(40) + suffix(80).
-_DESC_PREFIX = struct.Struct("<IBBBB")  # abi_version, address_space, visibility, access, backend_kind
-_DESC_SUFFIX = struct.Struct(f"<QQ{BACKEND_TOKEN_BYTES}s")  # nbytes, backend_handle, token
+# CanonicalIdentity (96 B): owner_instance_id[16] opaque, buffer_id u64, generation u32,
+#   path_len u16, _pad[2], owner_worker_path[PATH_MAX_BYTES] UTF-8.
+_CANONICAL_IDENTITY = struct.Struct(f"<{OWNER_INSTANCE_ID_BYTES}sQIH2x{PATH_MAX_BYTES}s")
+# BufferHandleDescriptor (216 B) = prefix(8) + CanonicalIdentity(96) + suffix.
+_DESC_PREFIX = struct.Struct("<HBBBBBx")  # abi_version, address_space, visibility, access, backend_kind, desc_version
+_DESC_SUFFIX = struct.Struct(f"<QH6x{DESC_MAX_BYTES}s")  # nbytes, body_len, body
 
 assert _CANONICAL_IDENTITY.size == CANONICAL_IDENTITY_BYTES, (_CANONICAL_IDENTITY.size, CANONICAL_IDENTITY_BYTES)
-assert _CANONICAL_IDENTITY.size == OWNER_WORKER_PATH_BYTES + 20, "identity = 2*u64 + path + u32"
 assert _DESC_PREFIX.size + _CANONICAL_IDENTITY.size + _DESC_SUFFIX.size == BUFFER_HANDLE_DESCRIPTOR_BYTES, (
     "BufferHandleDescriptor layout drift vs buffer_handle.h"
 )
@@ -86,39 +81,43 @@ assert _DESC_PREFIX.size + _CANONICAL_IDENTITY.size + _DESC_SUFFIX.size == BUFFE
 
 @dataclass(frozen=True)
 class CanonicalIdentity:
-    """Globally-unique allocation identity; the key of every import registry."""
+    """Globally-unique allocation identity; the key of every import registry.
 
-    owner_instance_id: int
+    ``owner_instance_id`` is 16 opaque bytes (bytewise-compared). ``owner_worker_path`` is a bounded
+    UTF-8 tree path such as ``"L4/L3[2]/L2[5]"``.
+    """
+
+    owner_instance_id: bytes
     buffer_id: int
-    owner_worker_path: tuple[int, ...]  # child index at each hop from root; len == tree depth
+    owner_worker_path: str = ""
     generation: int = 0
 
     def __post_init__(self) -> None:
-        if len(self.owner_worker_path) > MAX_WORKER_PATH_DEPTH:
+        if len(self.owner_instance_id) != OWNER_INSTANCE_ID_BYTES:
             raise ValueError(
-                f"owner_worker_path depth {len(self.owner_worker_path)} exceeds MAX_WORKER_PATH_DEPTH "
-                f"{MAX_WORKER_PATH_DEPTH}"
+                f"owner_instance_id must be {OWNER_INSTANCE_ID_BYTES} bytes, got {len(self.owner_instance_id)}"
             )
+        if len(self.owner_worker_path.encode("utf-8")) > PATH_MAX_BYTES:
+            raise ValueError(f"owner_worker_path exceeds PATH_MAX_BYTES ({PATH_MAX_BYTES})")
 
     def pack(self) -> bytes:
-        depth = len(self.owner_worker_path)
-        hops = list(self.owner_worker_path) + [0] * (MAX_WORKER_PATH_DEPTH - depth)
-        return _CANONICAL_IDENTITY.pack(self.owner_instance_id, self.buffer_id, depth, *hops, self.generation)
+        path = self.owner_worker_path.encode("utf-8")
+        return _CANONICAL_IDENTITY.pack(self.owner_instance_id, self.buffer_id, self.generation, len(path), path)
 
     @classmethod
     def unpack(cls, raw: bytes) -> CanonicalIdentity:
-        fields = _CANONICAL_IDENTITY.unpack(raw)
-        owner_instance_id, buffer_id, depth = fields[0], fields[1], fields[2]
-        hops = fields[3 : 3 + MAX_WORKER_PATH_DEPTH]
-        generation = fields[3 + MAX_WORKER_PATH_DEPTH]
-        if depth > MAX_WORKER_PATH_DEPTH:
-            raise ValueError(f"owner_worker_path depth {depth} exceeds MAX_WORKER_PATH_DEPTH {MAX_WORKER_PATH_DEPTH}")
-        return cls(owner_instance_id, buffer_id, tuple(hops[:depth]), generation)
+        owner_instance_id, buffer_id, generation, path_len, path = _CANONICAL_IDENTITY.unpack(raw)
+        if path_len > PATH_MAX_BYTES:
+            raise ValueError(f"owner_worker_path length {path_len} exceeds PATH_MAX_BYTES ({PATH_MAX_BYTES})")
+        return cls(owner_instance_id, buffer_id, path[:path_len].decode("utf-8"), generation)
 
 
 @dataclass(frozen=True)
 class BufferHandleDescriptor:
-    """The export-handshake wire payload — the owner's handle projected to a flat, versioned blob."""
+    """The export-handshake wire payload — the owner's handle projected to a flat, versioned blob.
+
+    ``body`` is the per-backend materialization (POSIX/fork shm name UTF-8, VMM handle bytes, ...).
+    """
 
     identity: CanonicalIdentity
     address_space: AddressSpace
@@ -126,33 +125,35 @@ class BufferHandleDescriptor:
     access: AccessMode
     backend_kind: BackendKind
     nbytes: int
-    token: str = ""  # NUL-terminated shm name for FORK_SHM/POSIX_SHM; "" otherwise
-    backend_handle: int = 0  # VMM shareable-handle / device ptr for VMM_WINDOW/DEVICE_MALLOC; 0 otherwise
+    body: bytes = b""
 
     def pack(self) -> bytes:
-        token = self.token.encode("utf-8")
-        if len(token) >= BACKEND_TOKEN_BYTES:
-            raise ValueError(f"backend token {self.token!r} too long ({len(token)} >= {BACKEND_TOKEN_BYTES})")
+        if len(self.body) > DESC_MAX_BYTES:
+            raise ValueError(f"backend body exceeds DESC_MAX_BYTES ({DESC_MAX_BYTES})")
         prefix = _DESC_PREFIX.pack(
             BUFFER_ABI_VERSION,
             int(self.address_space),
             int(self.visibility),
             int(self.access),
             int(self.backend_kind),
+            BUFFER_DESCRIPTOR_VERSION,
         )
-        suffix = _DESC_SUFFIX.pack(self.nbytes, self.backend_handle, token)
+        suffix = _DESC_SUFFIX.pack(self.nbytes, len(self.body), self.body)
         return prefix + self.identity.pack() + suffix
 
     @classmethod
     def unpack(cls, raw: bytes) -> BufferHandleDescriptor:
         if len(raw) < BUFFER_HANDLE_DESCRIPTOR_BYTES:
             raise ValueError(f"descriptor too small: {len(raw)} < {BUFFER_HANDLE_DESCRIPTOR_BYTES}")
-        abi_version, address_space, visibility, access, backend_kind = _DESC_PREFIX.unpack_from(raw, 0)
+        abi_version, address_space, visibility, access, backend_kind, descriptor_version = _DESC_PREFIX.unpack_from(
+            raw, 0
+        )
         if abi_version != BUFFER_ABI_VERSION:
             raise ValueError(f"unknown BufferHandle abi_version {abi_version} (expected {BUFFER_ABI_VERSION})")
+        if descriptor_version != BUFFER_DESCRIPTOR_VERSION:
+            raise ValueError(f"unknown backend descriptor_version {descriptor_version}")
         identity = CanonicalIdentity.unpack(raw[_DESC_PREFIX.size : _DESC_PREFIX.size + _CANONICAL_IDENTITY.size])
-        nbytes, backend_handle, token = _DESC_SUFFIX.unpack_from(raw, _DESC_PREFIX.size + _CANONICAL_IDENTITY.size)
-        token_str = token.split(b"\x00", 1)[0].decode("utf-8")
+        nbytes, body_len, body = _DESC_SUFFIX.unpack_from(raw, _DESC_PREFIX.size + _CANONICAL_IDENTITY.size)
         return cls(
             identity=identity,
             address_space=AddressSpace(address_space),
@@ -160,18 +161,14 @@ class BufferHandleDescriptor:
             access=AccessMode(access),
             backend_kind=BackendKind(backend_kind),
             nbytes=nbytes,
-            token=token_str,
-            backend_handle=backend_handle,
+            body=bytes(body[:body_len]),
         )
 
 
-# BufferRef (96 B): CanonicalIdentity(40) + byte_offset u64, ndims u32, shapes[MAX] u32,
-#   strides[MAX] u32, dtype u8, flags u8, reserved[2].
-_BUFFER_REF_TAIL = struct.Struct(f"<QI{MAX_TENSOR_DIMS}I{MAX_TENSOR_DIMS}IBB2x")
+# BufferRef (152 B): CanonicalIdentity(96) + byte_offset u64, ndims u32, shapes[MAX] u32,
+#   strides[MAX] u32, dtype u8, _pad[3].
+_BUFFER_REF_TAIL = struct.Struct(f"<QI{MAX_TENSOR_DIMS}I{MAX_TENSOR_DIMS}IB3x")
 assert _CANONICAL_IDENTITY.size + _BUFFER_REF_TAIL.size == BUFFER_REF_BYTES, "BufferRef layout drift"
-
-BUFFER_REF_FLAG_MANUAL_DEP = 1 << 0
-BUFFER_REF_FLAG_CONTIGUOUS = 1 << 1
 
 # BufferRef blob envelope (16 B): abi_version u32, ref_count i32, scalar_count i32, reserved u32.
 _BUFFERREF_BLOB_HEADER = struct.Struct("<IiiI")
@@ -187,7 +184,6 @@ class BufferRef:
     shapes: tuple[int, ...]
     strides: tuple[int, ...]
     dtype: int  # DataType enum value
-    flags: int = 0
 
     def __post_init__(self) -> None:
         if not 0 < len(self.shapes) <= MAX_TENSOR_DIMS:
@@ -199,7 +195,7 @@ class BufferRef:
         ndims = len(self.shapes)
         shapes = list(self.shapes) + [0] * (MAX_TENSOR_DIMS - ndims)
         strides = list(self.strides) + [0] * (MAX_TENSOR_DIMS - ndims)
-        tail = _BUFFER_REF_TAIL.pack(self.byte_offset, ndims, *shapes, *strides, self.dtype, self.flags)
+        tail = _BUFFER_REF_TAIL.pack(self.byte_offset, ndims, *shapes, *strides, self.dtype)
         return self.identity.pack() + tail
 
 
@@ -211,9 +207,9 @@ def pack_bufferref_blob(refs: list[BufferRef], scalars: tuple[int, ...] = ()) ->
     return header + body + tail
 
 
-def mint_owner_instance_id() -> int:
-    """A fresh 64-bit nonce, unique per owner incarnation (defends canonical identity against ABA)."""
-    return int.from_bytes(os.urandom(8), "little")
+def mint_owner_instance_id() -> bytes:
+    """A fresh 16-byte opaque nonce, unique per owner incarnation (defends identity against ABA)."""
+    return os.urandom(OWNER_INSTANCE_ID_BYTES)
 
 
 def _shm_base_addr(shm: SharedMemory) -> int:
@@ -236,8 +232,7 @@ class BufferHandle:
     access: AccessMode
     backend_kind: BackendKind
     nbytes: int
-    token: str = ""
-    backend_handle: int = 0
+    body: bytes = b""
     shm: SharedMemory | None = None
     base: int = 0
 
@@ -249,8 +244,7 @@ class BufferHandle:
             access=self.access,
             backend_kind=self.backend_kind,
             nbytes=self.nbytes,
-            token=self.token,
-            backend_handle=self.backend_handle,
+            body=self.body,
         )
 
     def close(self) -> None:
@@ -262,18 +256,21 @@ class BufferHandle:
 
 def create_host_shared_buffer(
     nbytes: int,
-    owner_instance_id: int,
+    owner_instance_id: bytes,
     buffer_id: int,
-    owner_worker_path: tuple[int, ...] = (),
+    owner_worker_path: str = "",
     generation: int = 0,
     visibility: Visibility = Visibility.SHARED,
     access: AccessMode = AccessMode.READWRITE,
 ) -> BufferHandle:
-    """Allocate a POSIX-shm host backing and wrap it as an owner ``BufferHandle`` (backend POSIX_SHM)."""
+    """Allocate a POSIX-shm host backing and wrap it as an owner ``BufferHandle`` (backend POSIX_SHM).
+
+    The backend body is the shm name (UTF-8); the consumer maps it by name in ``ImportRegistry``.
+    """
     if nbytes <= 0:
         raise ValueError(f"create_host_shared_buffer: nbytes must be positive, got {nbytes}")
     shm = SharedMemory(create=True, size=nbytes)
-    identity = CanonicalIdentity(owner_instance_id, buffer_id, tuple(owner_worker_path), generation)
+    identity = CanonicalIdentity(owner_instance_id, buffer_id, owner_worker_path, generation)
     return BufferHandle(
         identity=identity,
         address_space=AddressSpace.HOST,
@@ -281,8 +278,7 @@ def create_host_shared_buffer(
         access=access,
         backend_kind=BackendKind.POSIX_SHM,
         nbytes=nbytes,
-        token=shm.name,
-        backend_handle=0,
+        body=shm.name.encode("utf-8"),
         shm=shm,
         base=_shm_base_addr(shm),
     )
@@ -303,8 +299,7 @@ class ImportRegistry:
     """Per-consumer-endpoint registry: register an export descriptor, resolve identity -> local base.
 
     Keyed by the packed canonical identity so lookups are exact (never a numeric-range guess). Host
-    shm backends are mapped into this process on register; a later ``BufferRef`` referencing the
-    handle resolves to the local base without re-sending the descriptor.
+    shm backends are mapped into this process on register.
     """
 
     def __init__(self) -> None:
@@ -313,7 +308,7 @@ class ImportRegistry:
     def register(self, descriptor: BufferHandleDescriptor | bytes) -> ImportedBuffer:
         desc = BufferHandleDescriptor.unpack(descriptor) if isinstance(descriptor, (bytes, bytearray)) else descriptor
         if desc.backend_kind in (BackendKind.POSIX_SHM, BackendKind.FORK_SHM):
-            shm = SharedMemory(name=desc.token)
+            shm = SharedMemory(name=desc.body.decode("utf-8"))
             imported = ImportedBuffer(desc.identity, _shm_base_addr(shm), desc.nbytes, desc.address_space, shm)
         elif desc.backend_kind == BackendKind.REMOTE_SIDECAR:
             raise ValueError("ImportRegistry: REMOTE_SIDECAR backend is reserved for P2")

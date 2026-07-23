@@ -8,15 +8,15 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-// Wire-ABI tests for BufferHandle / BufferRef (buffer_handle.h). The byte layout is pinned by
-// static_assert in the header; these tests pin the values that outlive a compile (sizes, enum
-// values, version) and exercise the trivially-copyable memcpy round trip and the canonical
-// identity key used by the import registry.
+// Wire-ABI tests for BufferHandle / BufferRef (buffer_handle.h), implementing the frozen logical
+// schema in .docs/L3-new/worker-memory-model/bufferhandle-abi.md. Byte layout is pinned by
+// static_assert in the header; these tests pin the sizes, enum values, and the blob codec.
 
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -26,14 +26,21 @@
 
 namespace {
 
+CanonicalIdentity make_identity() {
+    CanonicalIdentity id{};
+    for (uint32_t i = 0; i < OWNER_INSTANCE_ID_BYTES; ++i)
+        id.owner_instance_id[i] = static_cast<uint8_t>(0xA0 + i);
+    id.buffer_id = 0x0102030405060708ULL;
+    id.generation = 7;
+    const char *path = "L4/L3[2]";
+    id.path_len = static_cast<uint16_t>(std::strlen(path));
+    std::memcpy(id.owner_worker_path, path, id.path_len);
+    return id;
+}
+
 BufferRef make_ref() {
     BufferRef r{};
-    r.identity.owner_instance_id = 0xA1A2A3A4A5A6A7A8ULL;
-    r.identity.buffer_id = 0x0102030405060708ULL;
-    r.identity.owner_worker_path.depth = 2;
-    r.identity.owner_worker_path.hop[0] = 3;
-    r.identity.owner_worker_path.hop[1] = 5;
-    r.identity.generation = 7;
+    r.identity = make_identity();
     r.byte_offset = 4096;
     r.ndims = 3;
     r.shapes[0] = 2;
@@ -43,23 +50,23 @@ BufferRef make_ref() {
     r.strides[1] = 8;
     r.strides[2] = 1;
     r.dtype = DataType::FLOAT16;
-    r.flags = BUFFER_REF_MANUAL_DEP | BUFFER_REF_CONTIGUOUS;
     return r;
 }
 
-// --- Layout / value contracts (survive a compile; document the frozen ABI) -------------------
+// --- Layout / value contracts (frozen ABI) -----------------------------------------------------
 
 TEST(BufferHandleAbi, StructSizesAreFrozen) {
-    EXPECT_EQ(sizeof(OwnerWorkerPath), 20u);
-    EXPECT_EQ(sizeof(CanonicalIdentity), 40u);
-    EXPECT_EQ(sizeof(BufferRef), 96u);
-    EXPECT_EQ(sizeof(BufferHandleDescriptor), 128u);
+    EXPECT_EQ(sizeof(CanonicalIdentity), 96u);
+    EXPECT_EQ(sizeof(BufferRef), 152u);
+    EXPECT_EQ(sizeof(BufferHandleDescriptor), 216u);
 }
 
-TEST(BufferHandleAbi, EnvelopeConstantsAreFrozen) {
-    EXPECT_EQ(BUFFER_ABI_VERSION, 1u);
-    EXPECT_EQ(MAX_WORKER_PATH_DEPTH, 4u);
-    EXPECT_EQ(BACKEND_TOKEN_BYTES, 64u);
+TEST(BufferHandleAbi, ConstantsAreFrozen) {
+    EXPECT_EQ(BUFFER_ABI_VERSION, 1);
+    EXPECT_EQ(BUFFER_DESCRIPTOR_VERSION, 1);
+    EXPECT_EQ(OWNER_INSTANCE_ID_BYTES, 16u);
+    EXPECT_EQ(PATH_MAX_BYTES, 64u);
+    EXPECT_EQ(DESC_MAX_BYTES, 96u);
 }
 
 TEST(BufferHandleAbi, EnumValuesAreFrozen) {
@@ -70,15 +77,14 @@ TEST(BufferHandleAbi, EnumValuesAreFrozen) {
     EXPECT_EQ(static_cast<uint8_t>(AccessMode::READ), 0);
     EXPECT_EQ(static_cast<uint8_t>(AccessMode::WRITE), 1);
     EXPECT_EQ(static_cast<uint8_t>(AccessMode::READWRITE), 2);
-    EXPECT_EQ(static_cast<uint8_t>(BackendKind::INVALID), 0);
-    EXPECT_EQ(static_cast<uint8_t>(BackendKind::FORK_SHM), 1);
-    EXPECT_EQ(static_cast<uint8_t>(BackendKind::POSIX_SHM), 2);
-    EXPECT_EQ(static_cast<uint8_t>(BackendKind::VMM_WINDOW), 3);
+    EXPECT_EQ(static_cast<uint8_t>(BackendKind::FORK_SHM), 0);
+    EXPECT_EQ(static_cast<uint8_t>(BackendKind::POSIX_SHM), 1);
+    EXPECT_EQ(static_cast<uint8_t>(BackendKind::VMM_WINDOW), 2);
+    EXPECT_EQ(static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR), 3);
     EXPECT_EQ(static_cast<uint8_t>(BackendKind::DEVICE_MALLOC), 4);
-    EXPECT_EQ(static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR), 5);
 }
 
-// --- memcpy round trip (blob transport is memcpy of trivially-copyable structs) --------------
+// --- memcpy round trip -------------------------------------------------------------------------
 
 TEST(BufferHandleAbi, BufferRefSurvivesByteRoundTrip) {
     BufferRef src = make_ref();
@@ -90,22 +96,22 @@ TEST(BufferHandleAbi, BufferRefSurvivesByteRoundTrip) {
     EXPECT_EQ(dst.byte_offset, 4096u);
     EXPECT_EQ(dst.dtype, DataType::FLOAT16);
     EXPECT_EQ(dst.strides[0], 32u);
-    EXPECT_EQ(dst.flags & BUFFER_REF_MANUAL_DEP, BUFFER_REF_MANUAL_DEP);
+    EXPECT_EQ(dst.identity, src.identity);
 }
 
 TEST(BufferHandleAbi, HandleDescriptorSurvivesByteRoundTrip) {
     BufferHandleDescriptor src{};
     src.abi_version = BUFFER_ABI_VERSION;
-    src.identity.owner_instance_id = 0xDEADBEEFULL;
-    src.identity.buffer_id = 42;
-    src.identity.generation = 1;
+    src.address_space = static_cast<uint8_t>(AddressSpace::DEVICE);
+    src.visibility = static_cast<uint8_t>(Visibility::SHARED);
+    src.access = static_cast<uint8_t>(AccessMode::READWRITE);
+    src.backend_kind = static_cast<uint8_t>(BackendKind::POSIX_SHM);
+    src.descriptor_version = BUFFER_DESCRIPTOR_VERSION;
+    src.identity = make_identity();
     src.nbytes = 1 << 20;
-    src.address_space = AddressSpace::DEVICE;
-    src.visibility = Visibility::SHARED;
-    src.access = AccessMode::READWRITE;
-    src.backend_kind = BackendKind::VMM_WINDOW;
-    src.backend_handle = 0x7f00abcdULL;
-    std::strncpy(src.token, "psm_deadbeef", BACKEND_TOKEN_BYTES - 1);
+    const char *body = "psm_deadbeef";
+    src.body_len = static_cast<uint16_t>(std::strlen(body));
+    std::memcpy(src.body, body, src.body_len);
 
     uint8_t bytes[sizeof(BufferHandleDescriptor)];
     std::memcpy(bytes, &src, sizeof(BufferHandleDescriptor));
@@ -113,48 +119,41 @@ TEST(BufferHandleAbi, HandleDescriptorSurvivesByteRoundTrip) {
     std::memcpy(&dst, bytes, sizeof(BufferHandleDescriptor));
     EXPECT_EQ(std::memcmp(&src, &dst, sizeof(BufferHandleDescriptor)), 0);
     EXPECT_EQ(dst.abi_version, BUFFER_ABI_VERSION);
-    EXPECT_EQ(dst.address_space, AddressSpace::DEVICE);
-    EXPECT_STREQ(dst.token, "psm_deadbeef");
+    EXPECT_EQ(dst.identity, src.identity);
+    EXPECT_EQ(std::string(dst.body, dst.body_len), "psm_deadbeef");
 }
 
 // --- canonical identity: the import-registry key -----------------------------------------------
 
-TEST(BufferHandleAbi, RefAndDescriptorAgreeOnIdentity) {
-    BufferRef r = make_ref();
-    BufferHandleDescriptor d{};
-    d.identity = r.identity;
-    EXPECT_EQ(r.identity, d.identity);
-}
+TEST(BufferHandleAbi, IdentityDistinguishesGenerationOwnerPath) {
+    CanonicalIdentity a = make_identity();
+    CanonicalIdentity b = make_identity();
+    EXPECT_EQ(a, b);
 
-TEST(BufferHandleAbi, IdentityDistinguishesGenerationAndOwner) {
-    BufferRef a = make_ref();
-    BufferRef b = make_ref();
-    EXPECT_EQ(a.identity, b.identity);
+    b.generation = a.generation + 1;  // buffer_id reuse across generations (ABA)
+    EXPECT_NE(a, b);
 
-    b.identity.generation = a.identity.generation + 1;  // buffer_id reuse across generations (ABA)
-    EXPECT_NE(a.identity, b.identity);
+    CanonicalIdentity c = make_identity();
+    c.owner_instance_id[0] ^= 0xFF;  // different owner incarnation nonce
+    EXPECT_NE(a, c);
 
-    BufferRef c = make_ref();
-    c.identity.owner_instance_id = a.identity.owner_instance_id + 1;  // same buffer_id, different owner incarnation
-    EXPECT_NE(a.identity, c.identity);
-
-    BufferRef e = make_ref();
-    e.identity.owner_worker_path.hop[0] = a.identity.owner_worker_path.hop[0] + 1;  // different owner path
-    EXPECT_NE(a.identity, e.identity);
+    CanonicalIdentity e = make_identity();
+    const char *p2 = "L4/L3[3]";  // different owner path (same length)
+    std::memcpy(e.owner_worker_path, p2, e.path_len);
+    EXPECT_NE(a, e);
 }
 
 TEST(BufferHandleAbi, IdentityHashMatchesEquality) {
     CanonicalIdentityHash h;
-    BufferRef a = make_ref();
-    BufferRef b = make_ref();
-    EXPECT_EQ(h(a.identity), h(b.identity));
+    CanonicalIdentity a = make_identity();
+    CanonicalIdentity b = make_identity();
+    EXPECT_EQ(h(a), h(b));
 
-    b.identity.generation = a.identity.generation + 1;
-    // Not a strict requirement, but a good hash separates the ABA case.
-    EXPECT_NE(h(a.identity), h(b.identity));
+    b.generation = a.generation + 1;
+    EXPECT_NE(h(a), h(b));  // good hash separates the ABA case (not a strict requirement)
 }
 
-// --- BufferRef wire blob: versioned length-prefixed round trip + rejection ---------------------
+// --- BufferRef wire blob: versioned length-prefixed round trip + rejection ----------------------
 
 BufferRef make_ref_b() {
     BufferRef r = make_ref();
@@ -209,9 +208,7 @@ TEST(BufferRefBlob, RejectsTruncatedCapacity) {
     BufferRef refs[1] = {make_ref()};
     std::vector<uint8_t> buf(bufferref_blob_size(1, 0));
     write_bufferref_blob(buf.data(), refs, 1, nullptr, 0);
-    // Header claims 1 ref but capacity covers only the header.
     EXPECT_THROW(read_bufferref_blob(buf.data(), BUFFERREF_BLOB_HEADER_SIZE), std::runtime_error);
-    // Capacity below even the header.
     EXPECT_THROW(read_bufferref_blob(buf.data(), 4), std::runtime_error);
 }
 
