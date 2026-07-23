@@ -1668,6 +1668,38 @@ NB_MODULE(_task_interface, m) {
         "map passed to materialize_bufferref_blob."
     );
 
+    m.def(
+        "bufferref_blob_refs",
+        [](uint64_t blob_ptr, size_t capacity) -> nb::list {
+            const uint8_t *src = reinterpret_cast<const uint8_t *>(blob_ptr);
+            BufferRefBlobView view = read_bufferref_blob(src, capacity);
+            nb::list out;
+            for (int32_t i = 0; i < view.ref_count; i++) {
+                BufferRef r = view.ref(i);
+                out.append(nb::bytes(reinterpret_cast<const char *>(&r), sizeof(BufferRef)));
+            }
+            return out;
+        },
+        nb::arg("blob_ptr"), nb::arg("capacity"),
+        "Extract each full packed BufferRef (descriptor + view) from a BufferRef blob, in ref order. "
+        "Used by an L3 orch endpoint to re-export each backing under a local identity before "
+        "forwarding to L2 (no BufferRef pass-through)."
+    );
+
+    m.def(
+        "bufferref_blob_scalars",
+        [](uint64_t blob_ptr, size_t capacity) -> nb::list {
+            const uint8_t *src = reinterpret_cast<const uint8_t *>(blob_ptr);
+            BufferRefBlobView view = read_bufferref_blob(src, capacity);
+            nb::list out;
+            for (int32_t i = 0; i < view.scalar_count; i++) {
+                out.append(view.scalars[i]);
+            }
+            return out;
+        },
+        nb::arg("blob_ptr"), nb::arg("capacity"), "Extract the scalar args (uint64) from a BufferRef blob, in order."
+    );
+
     nb::class_<L2ChildOnboardRegionExport>(m, "_L2ChildOnboardRegionExport")
         .def_ro("device_addr", &L2ChildOnboardRegionExport::device_addr)
         .def_ro("mapping_bytes", &L2ChildOnboardRegionExport::mapping_bytes)

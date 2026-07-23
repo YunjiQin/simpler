@@ -37,6 +37,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     PATH_MAX_BYTES,
     DataType,
     bufferref_blob_descriptors,
+    bufferref_blob_refs,
     get_element_size,
 )
 
@@ -218,6 +219,16 @@ class BufferRef:
         strides = list(self.strides) + [0] * (MAX_TENSOR_DIMS - ndims)
         tail = _BUFFER_REF_TAIL.pack(self.byte_offset, ndims, *shapes, *strides, self.dtype)
         return self.handle.pack() + tail
+
+    @classmethod
+    def unpack(cls, raw: bytes) -> BufferRef:
+        handle = BufferHandleDescriptor.unpack(raw[:BUFFER_HANDLE_DESCRIPTOR_BYTES])
+        vals = _BUFFER_REF_TAIL.unpack(raw[BUFFER_HANDLE_DESCRIPTOR_BYTES:BUFFER_REF_BYTES])
+        byte_offset, ndims = vals[0], vals[1]
+        shapes = tuple(vals[2 : 2 + ndims])
+        strides = tuple(vals[2 + MAX_TENSOR_DIMS : 2 + MAX_TENSOR_DIMS + ndims])
+        dtype = vals[2 + 2 * MAX_TENSOR_DIMS]
+        return cls(handle=handle, byte_offset=byte_offset, shapes=shapes, strides=strides, dtype=dtype)
 
     # --- view algebra (zero-copy metadata rewrites, mirroring Tensor) ------------------------------
 
@@ -409,6 +420,36 @@ def create_host_shared_buffer(
     )
 
 
+def re_export(
+    source: BufferHandleDescriptor,
+    owner_instance_id: bytes,
+    buffer_id: int,
+    owner_worker_path: str = "",
+    generation: int = 1,
+) -> BufferHandle:
+    """Re-export a received handle descriptor under a NEW local identity, WITHOUT mapping.
+
+    Each L3+ level's orch sees only its own handles: a ref to an upper-level backing is re-exported to
+    a local handle ``H'`` on receipt. ``H'`` carries a fresh identity (this level owns it) but the
+    SAME backing as ``source`` (backend_kind / body / nbytes / address_space / visibility / access).
+    No mmap — ``base=0``, ``shm=None``; a downstream consumer materializes the backing lazily (only a
+    compute leaf actually maps). Re-export is per-backing (memoize by ``source.identity``), so pure
+    forwarding carries no per-ref map cost.
+    """
+    identity = CanonicalIdentity(owner_instance_id, buffer_id, owner_worker_path, generation)
+    return BufferHandle(
+        identity=identity,
+        address_space=source.address_space,
+        visibility=source.visibility,
+        access=source.access,
+        backend_kind=source.backend_kind,
+        nbytes=source.nbytes,
+        body=source.body,
+        shm=None,
+        base=0,
+    )
+
+
 def wrap_fork_inherited(
     data_ptr: int,
     nbytes: int,
@@ -449,6 +490,33 @@ class ImportedBuffer:
     nbytes: int
     address_space: AddressSpace = AddressSpace.HOST
     shm: SharedMemory | None = None  # the consumer's own mapping for shm backends
+
+
+@dataclass
+class MappedArg:
+    """A Python compute (sub-worker) task arg: a BufferRef materialized into this process, exposing a
+    writable ``buffer`` at the view origin plus the view geometry. The callable computes with e.g.
+    ``torch.frombuffer(arg.buffer, dtype=<from arg.dtype>, count=prod(arg.shapes))`` — reads/writes
+    land in the shared backing the owner sees.
+    """
+
+    imported: ImportedBuffer
+    byte_offset: int
+    shapes: tuple[int, ...]
+    strides: tuple[int, ...]
+    dtype: int  # DataType value
+
+    @property
+    def buffer(self) -> memoryview:
+        """A memoryview over the mapped backing at this view's origin (``byte_offset``)."""
+        ib = self.imported
+        if ib.shm is not None:
+            base = ib.shm.buf
+            assert base is not None
+        else:
+            # FORK_SHM (COW): no shm object — wrap the inherited VA range.
+            base = memoryview((ctypes.c_char * ib.nbytes).from_address(ib.base))
+        return base[self.byte_offset :]
 
 
 class ImportRegistry:
@@ -493,6 +561,16 @@ class ImportRegistry:
         for desc_bytes in bufferref_blob_descriptors(blob_ptr, capacity):
             self.materialize(desc_bytes)
         return self.materialization_map()
+
+    def mapped_args_from_blob(self, blob_ptr: int, capacity: int) -> list[MappedArg]:
+        """Materialize every ref in a BufferRef blob into a MappedArg for a Python compute callable:
+        map each backing (map-once) and expose a buffer at the view origin. This is the compute-leaf
+        map (a sub-worker reads/writes), distinct from pure forwarding (re-export, which never maps).
+        """
+        return [
+            MappedArg(self.materialize(ref.handle), ref.byte_offset, ref.shapes, ref.strides, ref.dtype)
+            for ref in (BufferRef.unpack(rb) for rb in bufferref_blob_refs(blob_ptr, capacity))
+        ]
 
     def resolve(self, identity: CanonicalIdentity) -> ImportedBuffer:
         imported = self._by_identity.get(identity.pack())

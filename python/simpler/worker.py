@@ -92,16 +92,19 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     _l3_host_mapped_region_import_sim,
     _mailbox_load_i32,
     _mailbox_store_i32,
+    bufferref_blob_refs,
     materialize_bufferref_blob,
-    read_args_from_blob,
 )
 
 from . import _log as _simpler_log
 from .buffer_handle import (
     BufferHandle,
+    BufferHandleDescriptor,
+    BufferRef,
     ImportRegistry,
     create_host_shared_buffer,
     mint_owner_instance_id,
+    re_export,
 )
 from .callable_identity import (
     CALLABLE_HASH_DIGEST_BYTES,
@@ -974,22 +977,21 @@ def _format_exc(prefix: str, exc: BaseException) -> str:
     return f"{prefix}: {type(exc).__name__}: {exc}"
 
 
-def _read_args_from_mailbox(buf, import_registry: ImportRegistry):
-    """Materialize the mailbox BufferRef args blob into a Tensor ``TensorTaskArgs`` for a Python callable.
+def _reexport_args_from_mailbox(buf, worker: Worker) -> list[BufferRef]:
+    """Re-export the mailbox BufferRef args for an orchestrator (nested L4→L3) child.
 
-    Used by the Python-targeted child loops (sub_worker, nested L4+ child) where the destination of
-    ``args`` is a Python callable that needs a typed args object with Tensors. The mailbox carries a
-    BufferRef blob (the L3→L2 wire): resolve each ref's embedded handle to a local base (map-once via
-    ``import_registry``), build the Tensor blob at those bases, then decode it via C++ ``read_blob``
-    (single source of truth for the Tensor layout — the Python re-impl that once lived here dropped
-    the address-space byte, silently breaking device pointers). The chip-child loops forward the
-    materialized Tensor blob straight to ``run_from_blob`` instead of decoding a typed object.
+    Each received ref's backing is re-exported to a handle owned by ``worker`` (per-backing, no map),
+    and a new ref carrying the original view (byte_offset / shapes / strides / dtype) is built over it.
+    The inner orch fn thus sees only ``worker``'s own handles and forwards them to L2 with no map cost
+    (no BufferRef pass-through). The compute leaf downstream maps lazily.
     """
     args_ptr = _buffer_field_addr(buf, _OFF_TASK_ARGS_BLOB)
-    resolved = import_registry.materialize_blob(args_ptr, _MAILBOX_ARGS_CAPACITY)
-    tensor_blob = materialize_bufferref_blob(args_ptr, _MAILBOX_ARGS_CAPACITY, resolved)
-    scratch = ctypes.create_string_buffer(tensor_blob, len(tensor_blob))
-    return read_args_from_blob(ctypes.addressof(scratch))
+    out: list[BufferRef] = []
+    for ref_bytes in bufferref_blob_refs(args_ptr, _MAILBOX_ARGS_CAPACITY):
+        ref = BufferRef.unpack(ref_bytes)
+        h_prime = worker._reexport(ref.handle)
+        out.append(h_prime.ref(shapes=ref.shapes, dtype=ref.dtype, strides=ref.strides, byte_offset=ref.byte_offset))
+    return out
 
 
 def _sub_worker_loop(
@@ -1023,7 +1025,10 @@ def _sub_worker_loop(
                     msg = f"sub_worker: callable hash {_format_digest(digest)} not registered"
                 else:
                     try:
-                        args = _read_args_from_mailbox(buf, import_registry)
+                        # Compute leaf: materialize each arg (map-once) into a MappedArg the Python
+                        # callable computes on via torch.frombuffer(arg.buffer, ...).
+                        args_ptr = _buffer_field_addr(buf, _OFF_TASK_ARGS_BLOB)
+                        args = import_registry.mapped_args_from_blob(args_ptr, _MAILBOX_ARGS_CAPACITY)
                         fn(args)
                     except Exception as e:  # noqa: BLE001
                         code = 1
@@ -1722,7 +1727,6 @@ def _child_worker_loop(
     into the inner Worker (see docs section 7).
     """
     state_addr = _buffer_field_addr(buf, _OFF_STATE)
-    import_registry = ImportRegistry()  # lazy per-endpoint import cache: canonical identity -> local base
     while True:
         state = _mailbox_load_i32(state_addr)
         if state == _TASK_READY:
@@ -1736,7 +1740,10 @@ def _child_worker_loop(
                 msg = f"child_worker: callable hash {_format_digest(digest)} not registered"
             else:
                 try:
-                    args = _read_args_from_mailbox(buf, import_registry)
+                    # Orchestrator (not a compute leaf): re-export each received backing to a local
+                    # handle H' (per-backing, no map) so the inner orch sees only its own handles;
+                    # pure forwarding to L2 carries no map cost.
+                    args = _reexport_args_from_mailbox(buf, inner_worker)
                     cfg = _read_config_from_mailbox(buf)
                     inner_worker.run(orch_fn, args, cfg)
                 except Exception as e:  # noqa: BLE001
@@ -1803,7 +1810,6 @@ def _child_worker_loop(
             _write_error(buf, code, msg)
             _mailbox_store_i32(state_addr, _CONTROL_DONE)
         elif state == _SHUTDOWN:
-            import_registry.close()
             inner_worker.close()
             break
 
@@ -2122,6 +2128,11 @@ class Worker:
         self._owner_instance_id: bytes = mint_owner_instance_id()
         self._buffer_id_counter: int = 1
         self._buffer_handles: dict[int, BufferHandle] = {}
+        # Re-export table (points 1-4): an upper-level ref received by this worker's orch is re-exported
+        # to a local handle H' under this worker's identity, per-backing (keyed by source identity),
+        # so each level's orch sees only its own handles. No map here — H' relabels the backing;
+        # a compute leaf maps lazily. Lifetime is worker-scoped for now.
+        self._reexport_by_source: dict[bytes, BufferHandle] = {}
 
     @property
     def _initialized(self) -> bool:
@@ -5340,14 +5351,32 @@ class Worker:
         with self._operation_lease("create_buffer"):
             return self._create_buffer_locked(int(nbytes))
 
+    def _next_buffer_id(self) -> int:
+        with self._registry_lock:
+            bid = self._buffer_id_counter
+            self._buffer_id_counter += 1
+        return bid
+
+    def _reexport(self, source: BufferHandleDescriptor) -> BufferHandle:
+        """Re-export a received backing under this worker's identity (per-backing, memoized, no map).
+
+        An upper-level ref reaching this worker's orch is relabeled to a local handle H' so the orch
+        sees only its own handles; H' is minted once per source backing (keyed by source identity) and
+        never mapped here — a downstream compute leaf maps it lazily. Worker-scoped lifetime for now.
+        """
+        key = source.identity.pack()
+        handle = self._reexport_by_source.get(key)
+        if handle is None:
+            handle = re_export(source, self._owner_instance_id, self._next_buffer_id(), f"L{self.level}")
+            self._reexport_by_source[key] = handle
+        return handle
+
     def _create_buffer_locked(self, nbytes: int) -> BufferHandle:
         if not self._chip_shms and not self._sub_shms:
             raise RuntimeError("create_buffer requires at least one forked chip or sub child (this Worker has none)")
         if nbytes <= 0:
             raise ValueError("create_buffer: nbytes must be positive")
-        with self._registry_lock:
-            buffer_id = self._buffer_id_counter
-            self._buffer_id_counter += 1
+        buffer_id = self._next_buffer_id()
         handle = create_host_shared_buffer(
             nbytes,
             owner_instance_id=self._owner_instance_id,

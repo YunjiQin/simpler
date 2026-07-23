@@ -32,6 +32,7 @@ from simpler.buffer_handle import (
     create_host_shared_buffer,
     mint_owner_instance_id,
     pack_bufferref_blob,
+    re_export,
     wrap_fork_inherited,
 )
 
@@ -194,6 +195,37 @@ def test_bufferref_view_algebra():
             t.reshape((32,))
     finally:
         h.close()
+
+
+def test_bufferref_unpack_roundtrip():
+    oid = mint_owner_instance_id()
+    h = create_host_shared_buffer(64, oid, buffer_id=1, owner_worker_path="L3")
+    try:
+        ref = h.ref(shapes=(2, 4), dtype=DataType.FLOAT16.value, byte_offset=8)
+        assert BufferRef.unpack(ref.pack()) == ref
+    finally:
+        h.close()
+
+
+def test_re_export_new_identity_same_backing_no_map():
+    # An L4-owned backing re-exported under an L3 identity: new identity, same backing, NOT mapped.
+    l4 = mint_owner_instance_id()
+    src = create_host_shared_buffer(64, l4, buffer_id=7, owner_worker_path="L4")
+    try:
+        sdesc = src.to_descriptor()
+        l3 = mint_owner_instance_id()
+        hp = re_export(sdesc, l3, buffer_id=1, owner_worker_path="L3")
+        assert hp.identity.owner_instance_id == l3
+        assert hp.identity.owner_worker_path == "L3"
+        assert hp.identity != src.identity  # new identity — each level owns its handles
+        assert hp.backend_kind == BackendKind.POSIX_SHM
+        assert hp.body == sdesc.body and hp.nbytes == 64  # same backing
+        assert hp.shm is None and hp.base == 0  # no map (lazy — a compute leaf maps)
+        # a ref built from H' carries the L3 identity + the same shm body, so L2 can materialize it
+        r = hp.ref(shapes=(16,), dtype=DataType.FLOAT32.value)
+        assert BufferRef.unpack(r.pack()).handle.identity == hp.identity
+    finally:
+        src.close()
 
 
 def test_fork_inherited_zero_copy_materialize():
