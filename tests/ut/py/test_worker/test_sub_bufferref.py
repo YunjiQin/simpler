@@ -16,10 +16,21 @@ arrive via args and be mapped from its Ref.
 """
 
 import torch
-from simpler.task_interface import CallConfig, TaskArgs, TensorArgType
+from simpler.task_interface import CallConfig, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
 _F32 = 0  # DataType.FLOAT32 value
+
+
+def test_alloc_shared_tensor_sizes_by_shape():
+    hw = Worker(level=3, num_sub_workers=1)
+    hw.init()
+    try:
+        h = hw.alloc_shared_tensor((4, 8), DataType.FLOAT32)
+        assert h.nbytes == 4 * 8 * 4  # prod(shape) * element_size
+        assert h.shm is not None  # a shared, born-attached backing (kind3)
+    finally:
+        hw.close()
 
 
 def test_sub_worker_mapped_arg_readwrite():

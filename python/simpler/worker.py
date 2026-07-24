@@ -93,6 +93,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     _mailbox_load_i32,
     _mailbox_store_i32,
     bufferref_blob_refs,
+    get_element_size,
     materialize_bufferref_blob,
 )
 
@@ -5350,6 +5351,19 @@ class Worker:
             raise TypeError("create_buffer requires a level >= 3 Worker")
         with self._operation_lease("create_buffer"):
             return self._create_buffer_locked(int(nbytes))
+
+    def alloc_shared_tensor(self, shapes: tuple[int, ...], dtype) -> BufferHandle:
+        """Allocate a shared buffer sized for ``shapes`` × ``dtype`` (kind3; successor of ``orch.alloc``).
+
+        A shape-sized ``create_buffer``: the returned handle backs a ``shapes``-shaped tensor. Name it
+        for a task with ``handle.ref(shapes, dtype)`` and read/write its data with
+        ``torch.frombuffer(handle.shm.buf, ...)`` at the run boundary. (Managed auto-free lifecycle is a
+        later phase; for now the handle is released at ``close()`` like ``create_buffer``.)
+        """
+        nbytes = get_element_size(dtype)
+        for s in shapes:
+            nbytes *= int(s)
+        return self.create_buffer(int(nbytes))
 
     def _next_buffer_id(self) -> int:
         with self._registry_lock:
