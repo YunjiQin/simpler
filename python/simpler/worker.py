@@ -5346,15 +5346,15 @@ class Worker:
     def create_buffer(self, nbytes: int) -> BufferHandle:
         """Allocate a shared ``BufferHandle`` owned by this Worker (P1-B).
 
-        Like ``create_host_buffer``, the backing is a born-shared POSIX shm attached into every
-        forked child; unlike it, the handle carries a typed canonical identity and a self-describing
-        descriptor. No eager export handshake: the descriptor travels **embedded in every
-        ``BufferRef``** built over this handle, and a consumer materializes it lazily on first
-        receipt (map-once, keyed by canonical identity). Build a tensor over ``handle.shm.buf`` with
-        the buffer protocol. Not thread-safe against a concurrent run/create/free on the same Worker.
+        The backing is a POSIX shm; the handle carries a typed canonical identity and a self-describing
+        descriptor. No eager export handshake: the descriptor travels **embedded in every ``BufferRef``**
+        built over this handle, and a consumer materializes it lazily on first receipt (map-once, keyed
+        by canonical identity). At L3+ that consumer is a forked child; at L2 (a leaf, no children) the
+        Worker itself materializes the ref in-process on ``run``. Build a tensor over ``handle.shm.buf``
+        with the buffer protocol. Not thread-safe against a concurrent run/create/free on the same Worker.
         """
-        if self.level < 3:
-            raise TypeError("create_buffer requires a level >= 3 Worker")
+        if self.level < 2:
+            raise TypeError("create_buffer requires a level >= 2 Worker")
         with self._operation_lease("create_buffer"):
             return self._create_buffer_locked(int(nbytes))
 
@@ -5392,7 +5392,10 @@ class Worker:
         return handle
 
     def _create_buffer_locked(self, nbytes: int) -> BufferHandle:
-        if not self._chip_shms and not self._sub_shms:
+        # An L3+ buffer is consumed by a forked child that lazily maps it, so a childless L3+ buffer
+        # can reach no consumer. An L2 leaf has no children and materializes the ref in-process itself,
+        # so it needs none.
+        if self.level >= 3 and not self._chip_shms and not self._sub_shms:
             raise RuntimeError("create_buffer requires at least one forked chip or sub child (this Worker has none)")
         if nbytes <= 0:
             raise ValueError("create_buffer: nbytes must be positive")

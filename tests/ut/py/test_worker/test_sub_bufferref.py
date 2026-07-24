@@ -15,6 +15,7 @@ serve: a post-init create_buffer shm is not mapped in the pre-forked sub child, 
 arrive via args and be mapped from its Ref.
 """
 
+import pytest
 import torch
 from simpler.task_interface import CallConfig, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
@@ -31,6 +32,26 @@ def test_alloc_shared_tensor_sizes_by_shape():
         assert h.shm is not None  # a shared, born-attached backing (kind3)
     finally:
         hw.close()
+
+
+def test_create_buffer_at_l2_needs_no_child():
+    # An L2 leaf has no forked children — it materializes the ref in-process itself — so create_buffer
+    # must not require a child. The handle is a usable POSIX-shm backing.
+    w = Worker(level=2)
+    h = w._create_buffer_locked(64)
+    try:
+        assert h.nbytes == 64
+        assert h.shm is not None
+        t = torch.frombuffer(h.shm.buf, dtype=torch.float32, count=4)
+        t.fill_(3.0)
+        assert t.tolist() == [3.0, 3.0, 3.0, 3.0]
+        t = None
+        # The level guard now admits L2: the public create_buffer no longer TypeErrors on level, it
+        # reaches the READY check (this Worker is uninitialized).
+        with pytest.raises(RuntimeError, match="READY"):
+            w.create_buffer(64)
+    finally:
+        h.close()
 
 
 def test_sub_worker_mapped_arg_readwrite():
