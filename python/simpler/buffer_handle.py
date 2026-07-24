@@ -450,6 +450,45 @@ def re_export(
     )
 
 
+def remote_sidecar_ref(
+    shapes: tuple[int, ...],
+    dtype: int,
+    nbytes: int,
+    owner_worker_id: int,
+    buffer_id: int,
+    generation: int,
+    address_space: AddressSpace,
+) -> BufferRef:
+    """Build a ``REMOTE_SIDECAR`` BufferRef for a task arg destined for a remote worker.
+
+    An arg passed L4→remote-L3 cannot be materialized from a local backing — the data lives on another
+    machine and travels via the remote transport. Its BufferRef therefore carries ``backend_kind =
+    REMOTE_SIDECAR`` (a consumer decode-rejects a local materialize; the authoritative remote
+    descriptor rides in the per-task RemoteTaskArgsSidecar). The identity encodes the remote buffer
+    (``owner_worker_id`` folded into the opaque nonce, plus ``buffer_id`` / ``generation``) so
+    dependency inference and routing stay stable across the hop.
+    """
+    oid = int(owner_worker_id).to_bytes(OWNER_INSTANCE_ID_BYTES, "little")
+    identity = CanonicalIdentity(oid, buffer_id, f"remote/{owner_worker_id}", generation)
+    handle = BufferHandleDescriptor(
+        identity=identity,
+        address_space=address_space,
+        visibility=Visibility.SHARED,
+        access=AccessMode.READWRITE,
+        backend_kind=BackendKind.REMOTE_SIDECAR,
+        nbytes=nbytes,
+        body=b"",
+    )
+    shapes = tuple(shapes)
+    return BufferRef(
+        handle=handle,
+        byte_offset=0,
+        shapes=shapes,
+        strides=_row_major_strides(shapes),
+        dtype=int(dtype),
+    )
+
+
 def wrap_fork_inherited(
     data_ptr: int,
     nbytes: int,

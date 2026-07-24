@@ -623,9 +623,30 @@ def _storage_for_remote_task_args(args: TaskArgs) -> _RemoteTaskArgsStorage:
 
 def _task_args_add_ref(self: TaskArgs, ref, tag: TensorArgType = TensorArgType.INPUT) -> None:
     """Add a BufferRef task arg. ``ref`` is a ``simpler.buffer_handle.BufferRef`` (packable) or its
-    packed bytes. RemoteTensorRef (remote sidecar) is not yet migrated to the BufferRef wire."""
+    packed bytes. A RemoteTensorRef (arg destined for a remote worker) is rewritten to a
+    REMOTE_SIDECAR BufferRef (no local backing) with its remote descriptor tracked in the sidecar."""
     if isinstance(ref, RemoteTensorRef):
-        raise NotImplementedError("remote RemoteTensorRef submit is not yet migrated to the BufferRef wire (P1-B B3)")
+        from .buffer_handle import AddressSpace, remote_sidecar_ref
+
+        storage = _storage_for_remote_task_args(self)
+        handle = ref.handle
+        inline = handle.address_space == RemoteAddressSpace.HOST_INLINE
+        nbytes = ref.nbytes
+        assert nbytes is not None
+        placeholder = remote_sidecar_ref(
+            shapes=tuple(int(s) for s in ref.shape),
+            dtype=int(ref.dtype.value),
+            nbytes=int(nbytes),
+            owner_worker_id=0 if inline else int(handle.owner_worker_id),
+            buffer_id=0 if inline else int(handle._buffer_id),
+            generation=0 if inline else int(handle._generation),
+            address_space=(
+                AddressSpace.DEVICE if handle.address_space == RemoteAddressSpace.REMOTE_DEVICE else AddressSpace.HOST
+            ),
+        )
+        _TASK_ARGS_ADD_REF(self, placeholder.pack(), tag)
+        storage.sidecars.append(_sidecar_from_ref(storage, ref))
+        return
     packed = ref.pack() if hasattr(ref, "pack") else ref
     _TASK_ARGS_ADD_REF(self, packed, tag)
     with _REMOTE_TASK_ARGS_STORAGE_LOCK:
