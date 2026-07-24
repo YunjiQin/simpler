@@ -904,49 +904,6 @@ NB_MODULE(_task_interface, m) {
             "Return total number of arguments (tensors + scalars)."
         );
 
-    // --- TensorTaskArgs (Tensor-typed builder: root-L2 in-process run + the materialized form
-    //     read_args_from_blob returns). L3+ dispatch uses TaskArgs (BufferRef); this is the L2 side. ---
-    nb::class_<TensorTaskArgs>(m, "TensorTaskArgs", nb::is_weak_referenceable())
-        .def(nb::init<>())
-        .def(
-            "add_tensor",
-            [](TensorTaskArgs &self, const Tensor &t, TensorArgType tag) {
-                self.add_tensor(t, tag);
-            },
-            nb::arg("t"), nb::arg("tag") = TensorArgType::INPUT,
-            "Add a Tensor with an optional TensorArgType tag (default INPUT)."
-        )
-        .def("add_scalar", &TensorTaskArgs::add_scalar, nb::arg("s"))
-        .def(
-            "tensor",
-            [](const TensorTaskArgs &self, int32_t i) -> const Tensor & {
-                if (i < 0 || i >= self.tensor_count())
-                    throw std::out_of_range("TensorTaskArgs tensor index out of range");
-                return self.tensor(i);
-            },
-            nb::arg("i"), nb::rv_policy::reference_internal, "Return the Tensor at index i."
-        )
-        .def(
-            "scalar",
-            [](const TensorTaskArgs &self, int32_t i) -> uint64_t {
-                if (i < 0 || i >= self.scalar_count())
-                    throw std::out_of_range("TensorTaskArgs scalar index out of range");
-                return self.scalar(i);
-            },
-            nb::arg("i")
-        )
-        .def(
-            "tag",
-            [](const TensorTaskArgs &self, int32_t i) -> TensorArgType {
-                if (i < 0 || i >= self.tensor_count()) throw std::out_of_range("TensorTaskArgs tag index out of range");
-                return self.tag(i);
-            },
-            nb::arg("i")
-        )
-        .def("tensor_count", &TensorTaskArgs::tensor_count)
-        .def("scalar_count", &TensorTaskArgs::scalar_count)
-        .def("clear", &TensorTaskArgs::clear);
-
     // --- ArgDirection enum ---
     nb::enum_<ArgDirection>(m, "ArgDirection")
         .value("SCALAR", ArgDirection::SCALAR)
@@ -1467,16 +1424,6 @@ NB_MODULE(_task_interface, m) {
             "None; per-stage timing is emitted as `[STRACE]` log markers."
         )
         .def(
-            "run",
-            [](ChipWorker &self, int32_t callable_id, TensorTaskArgs &args, const CallConfig &config) {
-                TaskArgsView view = make_view(args);
-                self.run(callable_id, view, config);
-            },
-            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"),
-            "Launch a callable_id from a TensorTaskArgs (used for in-process callers). "
-            "Returns None; timing is emitted as `[STRACE]` log markers."
-        )
-        .def(
             "run_from_blob",
             [](ChipWorker &self, int32_t callable_id, uint64_t args_blob_ptr, size_t blob_capacity,
                const CallConfig &config) {
@@ -1577,7 +1524,7 @@ NB_MODULE(_task_interface, m) {
         "read_args_from_blob",
         [](uint64_t blob_ptr) {
             TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(blob_ptr), MAILBOX_ARGS_CAPACITY);
-            TensorTaskArgs args;
+            ChipStorageTaskArgs args;
             for (int32_t i = 0; i < view.tensor_count; i++) {
                 args.add_tensor(view.tensors(i));
             }
@@ -1587,7 +1534,7 @@ NB_MODULE(_task_interface, m) {
             return args;
         },
         nb::arg("blob_ptr"),
-        "Reconstruct a TaskArgs from a length-prefixed blob at blob_ptr. "
+        "Reconstruct a ChipStorageTaskArgs from a length-prefixed blob at blob_ptr. "
         "Tags are not preserved (blob wire format strips them)."
     );
 
@@ -1596,7 +1543,7 @@ NB_MODULE(_task_interface, m) {
         [](uint64_t blob_ptr, size_t capacity, nb::dict resolved) -> nb::bytes {
             const uint8_t *src = reinterpret_cast<const uint8_t *>(blob_ptr);
             BufferRefBlobView view = read_bufferref_blob(src, capacity);
-            TensorTaskArgs args;
+            ChipStorageTaskArgs args;
             for (int32_t i = 0; i < view.ref_count; i++) {
                 BufferRef r = view.ref(i);
                 uint64_t elem = get_element_size(r.dtype);
@@ -1622,7 +1569,7 @@ NB_MODULE(_task_interface, m) {
                     reinterpret_cast<void *>(static_cast<uintptr_t>(base + r.byte_offset)), r.shapes, r.strides,
                     r.ndims, r.dtype, /*manual_dep=*/false, /*version=*/0, static_cast<AddressSpace>(addr_space)
                 );
-                args.add_tensor(t, TensorArgType::INPUT);
+                args.add_tensor(t);
             }
             for (int32_t i = 0; i < view.scalar_count; i++) {
                 args.add_scalar(view.scalars[i]);
