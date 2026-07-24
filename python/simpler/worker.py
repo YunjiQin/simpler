@@ -99,6 +99,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
 
 from . import _log as _simpler_log
 from .buffer_handle import (
+    BackendKind,
     BufferHandle,
     BufferHandleDescriptor,
     BufferRef,
@@ -5212,11 +5213,16 @@ class Worker:
     def _child_ptrs_in_args(args: Any) -> list[tuple[int, int]]:
         """``(device_ptr, arg_index)`` for every device arg — used for kind4 device-pointer provenance.
 
-        A BufferRef carries no materialized address, so a device pointer is not extractable here under
-        the BufferRef wire; device-pointer provenance is deferred with the device/remote path. Host
-        refs contribute nothing.
+        A DEVICE_MALLOC ref carries the device pointer in its backend body (u64 LE); that pointer is the
+        provenance key the guard validates against ``_child_alloc_prov``. Host-backed refs (POSIX/fork
+        shm) contribute nothing.
         """
-        return []
+        out: list[tuple[int, int]] = []
+        for i in range(args.tensor_count()):
+            desc = BufferRef.unpack(args.ref(i)).handle
+            if desc.backend_kind == BackendKind.DEVICE_MALLOC:
+                out.append((int.from_bytes(desc.body[:8], "little"), i))
+        return out
 
     def _next_level_target_ids(self) -> Sequence[int]:
         """The full pool of dispatchable next-level worker ids.
