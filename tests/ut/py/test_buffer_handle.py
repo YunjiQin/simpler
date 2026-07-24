@@ -33,6 +33,7 @@ from simpler.buffer_handle import (
     mint_owner_instance_id,
     pack_bufferref_blob,
     re_export,
+    wrap_device_malloc,
     wrap_fork_inherited,
 )
 
@@ -226,6 +227,21 @@ def test_re_export_new_identity_same_backing_no_map():
         assert BufferRef.unpack(r.pack()).handle.identity == hp.identity
     finally:
         src.close()
+
+
+def test_device_malloc_wrap_materialize():
+    # A device pointer (from orch.malloc) wrapped as DEVICE_MALLOC: materializes to the pointer with
+    # no map, address_space DEVICE (-> a child_memory Tensor).
+    oid = mint_owner_instance_id()
+    h = wrap_device_malloc(0xDEAD0000, 4096, oid, buffer_id=3, owner_worker_path="L3")
+    assert h.backend_kind == BackendKind.DEVICE_MALLOC
+    assert h.address_space == AddressSpace.DEVICE
+    assert h.shm is None and h.base == 0xDEAD0000
+    reg = ImportRegistry()
+    imp = reg.materialize(h.to_descriptor())
+    assert imp.base == 0xDEAD0000
+    assert imp.address_space == AddressSpace.DEVICE
+    assert imp.shm is None
 
 
 def test_fork_inherited_zero_copy_materialize():

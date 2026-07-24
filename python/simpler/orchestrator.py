@@ -38,6 +38,7 @@ from typing import Any
 
 from _task_interface import _Orchestrator as _COrchestrator  # pyright: ignore[reportMissingImports]
 
+from .buffer_handle import BufferHandle, wrap_device_malloc
 from .callable_identity import CallableHandle
 from .task_interface import (
     CallConfig,
@@ -517,6 +518,23 @@ class Orchestrator:
             ptr = int(self._o.malloc(wid, sz))
             self._worker._child_prov_record_malloc(wid, ptr)
             return ptr
+
+    def device_handle(self, device_ptr: int, nbytes: int) -> BufferHandle:
+        """Wrap an ``orch.malloc`` device pointer as a DEVICE_MALLOC ``BufferHandle`` owned by this
+        worker, for naming a chip task arg as a BufferRef (``dev_h.ref(shapes, dtype)`` →
+        ``ta.add_ref(...)``). The pointer is chip-local (valid only on the worker that allocated it),
+        so the ref must be dispatched only to that worker — the successor of the ``child_memory=True``
+        Tensor.
+        """
+        if self._worker is None:
+            raise RuntimeError("orch.device_handle requires a Worker context")
+        return wrap_device_malloc(
+            int(device_ptr),
+            int(nbytes),
+            self._worker._owner_instance_id,
+            self._worker._next_buffer_id(),
+            f"L{self._worker.level}",
+        )
 
     def free(self, worker_id: int, ptr: int) -> None:
         """Free memory on next-level worker *worker_id*."""

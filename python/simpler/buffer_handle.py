@@ -481,6 +481,35 @@ def wrap_fork_inherited(
     )
 
 
+def wrap_device_malloc(
+    device_ptr: int,
+    nbytes: int,
+    owner_instance_id: bytes,
+    buffer_id: int,
+    owner_worker_path: str = "",
+    generation: int = 0,
+    access: AccessMode = AccessMode.READWRITE,
+) -> BufferHandle:
+    """Wrap a device pointer (from ``orch.malloc``) as a ``DEVICE_MALLOC`` ``BufferHandle``.
+
+    The backend body is the device pointer (u64 LE); the consumer materializes to that pointer with no
+    mapping. The pointer is valid only on the chip that allocated it, so a ref over this handle must be
+    dispatched only to that chip (a topology invariant, as for the former ``child_memory`` tensor).
+    """
+    identity = CanonicalIdentity(owner_instance_id, buffer_id, owner_worker_path, generation)
+    return BufferHandle(
+        identity=identity,
+        address_space=AddressSpace.DEVICE,
+        visibility=Visibility.PRIVATE,
+        access=access,
+        backend_kind=BackendKind.DEVICE_MALLOC,
+        nbytes=nbytes,
+        body=int(device_ptr).to_bytes(8, "little"),
+        shm=None,
+        base=int(device_ptr),
+    )
+
+
 @dataclass
 class ImportedBuffer:
     """A handle materialized into the consumer's address space: identity -> local base."""
@@ -540,9 +569,10 @@ class ImportRegistry:
         cached = self._by_identity.get(key)
         if cached is not None:
             return cached
-        if desc.backend_kind == BackendKind.FORK_SHM:
-            # COW-inherited at the same VA in every forked child: the body is the base VA (u64 LE),
-            # already valid in this process — no mapping.
+        if desc.backend_kind in (BackendKind.FORK_SHM, BackendKind.DEVICE_MALLOC):
+            # The body is the base pointer (u64 LE), already valid in this process — no mapping.
+            # FORK_SHM: a COW-inherited host VA. DEVICE_MALLOC: a device pointer valid on the chip that
+            # allocated it (the ref must only reach that chip — a topology invariant).
             base = int.from_bytes(desc.body, "little")
             imported = ImportedBuffer(desc.identity, base, desc.nbytes, desc.address_space, None)
         elif desc.backend_kind == BackendKind.POSIX_SHM:
