@@ -47,7 +47,7 @@ TEST(ChildMemory, SetChildMemory) {
 // ---------------------------------------------------------------------------
 
 TEST(ChildMemory, BlobRoundtripPreservesChildMemory) {
-    TaskArgs args;
+    TensorTaskArgs args;  // the Tensor-blob round trip is the L2/materialized form, not the BufferRef wire
 
     Tensor host_t{};
     host_t.buffer.addr = 0x1000;
