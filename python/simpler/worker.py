@@ -106,6 +106,7 @@ from .buffer_handle import (
     ImportRegistry,
     create_host_shared_buffer,
     mint_owner_instance_id,
+    pack_bufferref_blob,
     re_export,
 )
 from .callable_identity import (
@@ -2135,6 +2136,10 @@ class Worker:
         # so each level's orch sees only its own handles. No map here — H' relabels the backing;
         # a compute leaf maps lazily. Lifetime is worker-scoped for now.
         self._reexport_by_source: dict[bytes, BufferHandle] = {}
+        # L2 leaf only: the in-process consumer import cache. An L2 Worker materializes its own BufferRef
+        # args itself (no forked child, no mailbox), resolving each ref's descriptor to a local base
+        # map-once — the chip-child path minus the mailbox hop. Lazily created on first L2 run.
+        self._l2_import_registry: ImportRegistry | None = None
 
     @property
     def _initialized(self) -> bool:
@@ -5611,6 +5616,12 @@ class Worker:
         if errors:
             raise errors[0]
 
+    def _close_l2_import_registry(self) -> None:
+        """Close the L2 in-process consumer import cache (drops its mapped shm imports)."""
+        if self._l2_import_registry is not None:
+            self._l2_import_registry.close()
+            self._l2_import_registry = None
+
     def _release_all_buffer_handles(self) -> None:
         """Close + unlink every owner BufferHandle (called from close()).
 
@@ -5758,7 +5769,7 @@ class Worker:
         if self.level == 2:
             assert self._chip_worker is not None
             state = self._resolve_handle(callable, expected_namespace="LOCAL_CHIP")
-            self._chip_worker._run_slot(state.slot_id, args, cfg)
+            self._run_l2_materialized(state.slot_id, args, cfg)
             return None
 
         assert self._orch is not None
@@ -5808,6 +5819,37 @@ class Worker:
         # L3+ returns None like every other worker level; per-L2-child timing
         # is emitted as `[STRACE]` markers from each simpler_run.
         return None
+
+    def _run_l2_materialized(self, callable_id: int, args, cfg) -> None:
+        """Materialize an L2 leaf's BufferRef args to a Tensor blob in-process and run the kernel.
+
+        The user builds args as ``TaskArgs`` (BufferRef) at every level; an L2 leaf is the consumer of
+        its own args, so it does exactly what a chip child does — resolve each ref's embedded descriptor
+        to a local base (map-once, cached in ``_l2_import_registry``) and build the Tensor blob the
+        runtime reads — only without a mailbox, since the args are already in this process.
+
+        A legacy ``ChipStorageTaskArgs`` (a pre-BufferRef L2 caller — it has ``tensor()`` but no
+        ``ref()``) passes straight through to the runtime until that caller migrates to BufferRef.
+        """
+        if args is not None and not hasattr(args, "ref"):
+            self._chip_worker._run_slot(callable_id, args, cfg)  # type: ignore[union-attr]
+            return
+        if self._l2_import_registry is None:
+            self._l2_import_registry = ImportRegistry()
+        if args is None:
+            refs: list[BufferRef] = []
+            scalars: tuple[int, ...] = ()
+        else:
+            refs = [BufferRef.unpack(args.ref(i)) for i in range(args.tensor_count())]
+            scalars = tuple(args.scalar(i) for i in range(args.scalar_count()))
+        blob = pack_bufferref_blob(refs, scalars)
+        in_scratch = ctypes.create_string_buffer(blob, len(blob))
+        in_addr = ctypes.addressof(in_scratch)
+        resolved = self._l2_import_registry.materialize_blob(in_addr, len(blob))
+        tensor_blob = materialize_bufferref_blob(in_addr, len(blob), resolved)
+        out_scratch = ctypes.create_string_buffer(tensor_blob, len(tensor_blob))
+        assert self._chip_worker is not None
+        self._chip_worker._impl.run_from_blob(callable_id, ctypes.addressof(out_scratch), len(tensor_blob), cfg)
 
     @property
     def aicpu_dlopen_count(self) -> int:
@@ -6178,6 +6220,7 @@ class Worker:
         # still usable (before _worker.close()).
         _step(self._release_all_host_buffers)
         _step(self._release_all_buffer_handles)
+        _step(self._close_l2_import_registry)
 
         if self.level == 2:
 
