@@ -49,9 +49,9 @@ inline int validate_kernel_init_args(
 }
 
 inline int validate_kernel_prepare_callable_args(
-    const void *ctx, int32_t callable_id, const void *callable, size_t callable_size, const void *caller_stream
+    const void *ctx, int32_t callable_id, const void *callable, size_t callable_size
 ) {
-    if (ctx == nullptr || callable == nullptr || caller_stream == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    if (ctx == nullptr || callable == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) return PTO_RUNTIME_ERR_INTERNAL;
     if (callable_size < sizeof(ChipCallable)) return PTO_RUNTIME_ERR_INTERNAL;
     /* ChipCallable's storage_ is CALLABLE_CHILD_ALIGN-aligned relative to the
