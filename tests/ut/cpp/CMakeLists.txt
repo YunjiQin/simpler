@@ -516,6 +516,18 @@ target_link_libraries(test_kernel_entry_validation PRIVATE ${GTEST_MAIN_LIB} ${G
 add_test(NAME test_kernel_entry_validation COMMAND test_kernel_entry_validation)
 set_tests_properties(test_kernel_entry_validation PROPERTIES LABELS "no_hardware")
 
+add_executable(test_kernel_callable_cache common/test_kernel_callable_cache.cpp)
+target_include_directories(test_kernel_callable_cache PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
+target_link_libraries(test_kernel_callable_cache PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_kernel_callable_cache COMMAND test_kernel_callable_cache)
+set_tests_properties(test_kernel_callable_cache PROPERTIES LABELS "no_hardware")
+
 # Kernel-mode phase machine and restricted-vocabulary tables, table-driven with
 # fake ops: init/close balance, poison, sticky CLOSING with retry, and the
 # separate runtime-error vs teardown-error slots.
@@ -595,6 +607,15 @@ add_task_interface_test(test_chip_max_tensor_args types/test_chip_max_tensor_arg
 add_task_interface_test(test_callable_scalar_count types/test_callable_scalar_count.cpp)
 add_task_interface_test(test_call_config types/test_call_config.cpp)
 add_task_interface_test(test_kernel_invocation_header types/test_kernel_invocation_header.cpp)
+foreach(dispatch_test test_kernel_dispatch test_kernel_dispatch_unavailable)
+    add_common_utils_test(${dispatch_test} common/${dispatch_test}.cpp)
+    target_sources(${dispatch_test} PRIVATE
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/kernel_dispatch.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/kernel_invocation_consumer.cpp)
+    target_include_directories(${dispatch_test} PRIVATE
+        ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface)
+endforeach()
+
 
 # Contract test for upload_chip_callable_buffer caller-buffer immutability.
 # Pulls both task_interface (callable.h) and src/common (utils/fnv1a_64.h),
