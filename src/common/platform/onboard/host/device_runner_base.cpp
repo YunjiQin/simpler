@@ -45,6 +45,7 @@
 #include "common/sdma_warmup_layout.h"
 #include "common/unified_log.h"
 #include "host/acl_error_log.h"
+#include "host/capture_memcpy.h"
 #include "kernel_platform_ops.h"
 #include "host/host_phase_records_artifact.h"
 #include "host/raii_scope_guard.h"
@@ -53,6 +54,8 @@
 #include "runtime_c_api.h"
 #include "task_args_wire.h"
 #include "utils/elf_build_id.h"
+
+static_assert(KERNEL_MAX_FUNC_ID == RUNTIME_MAX_FUNC_ID, "Kernel child function ID bounds must match runtime");
 // `runtime.h` (pulled in via `device_runner_helpers.h` in the base header)
 // supplies the per-arch `Handshake` + `Runtime` types used by
 // `print_handshake_results` / `bind_callable_to_runtime` /
@@ -734,12 +737,24 @@ PersistentArgsOps DeviceRunnerBase::persistent_args_ops() {
         return static_cast<DeviceRunnerBase *>(context)->mem_alloc_.free(ptr);
     };
     ops.copy_h2d = [](void *, void *dst, size_t dst_bytes, const void *src, size_t src_bytes) -> int {
-        return static_cast<int>(rtMemcpy(dst, dst_bytes, src, src_bytes, RT_MEMCPY_HOST_TO_DEVICE));
+        return capture_memcpy_h2d(dst, dst_bytes, src, src_bytes);
     };
     ops.fill_arch_fields = [](void *context, KernelArgs *args, uint64_t device_id) -> int {
         return static_cast<DeviceRunnerBase *>(context)->fill_persistent_arch_fields(args, device_id);
     };
     return ops;
+}
+
+KernelCallableCache::Ops DeviceRunnerBase::kernel_callable_cache_ops() {
+    return {
+        this,
+        [](void *context, size_t bytes) -> void * {
+            return static_cast<DeviceRunnerBase *>(context)->mem_alloc_.alloc(bytes);
+        },
+        [](void *, void *dst, const void *src, size_t bytes) -> int {
+            return capture_memcpy_h2d(dst, bytes, src, bytes);
+        }
+    };
 }
 
 int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id) {
@@ -749,7 +764,11 @@ int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id) {
         return PTO_RUNTIME_ERR_INVALID_STATE;
     }
 
-    int rc = register_callable_on_device(callable_id, control_stream);
+    int rc = enqueue_device_register(callable_id, control_stream);
+    if (rc != 0) return rc;
+    // Host publication records successful enqueue; execution errors surface
+    // when the caller drains a warmup launch or the context.
+    rc = commit_device_register(callable_id);
     if (rc != 0) return rc;
 
     // Idempotent: only the first prepared callable allocates. The uploaded
@@ -932,6 +951,10 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
         return 0;
     }
 
+    if (execution_mode_latch_.is_kernel()) {
+        return kernel_callable_cache_.pending_uploaded_address();
+    }
+
     const ChipCallableLayout layout = compute_chip_callable_layout(callable);
 
     // Content-hash dedup: identical bytes → return cached chip_dev.
@@ -979,6 +1002,7 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
 }
 
 int DeviceRunnerBase::release_chip_callable_buffer(uint64_t hash) {
+    if (execution_mode_latch_.is_kernel()) return 0;
     if (hash == 0) {
         return 0;
     }
@@ -1061,10 +1085,10 @@ int DeviceRunnerBase::launch_device_register(int32_t callable_id) {
     return register_callable_on_device(callable_id, stream_aicpu_);
 }
 
-int DeviceRunnerBase::register_callable_on_device(int32_t callable_id, rtStream_t control_stream) {
+int DeviceRunnerBase::enqueue_device_register(int32_t callable_id, rtStream_t control_stream) {
     auto it = callables_.find(callable_id);
     if (it == callables_.end()) {
-        LOG_ERROR("register_callable_on_device: callable_id=%d not registered", callable_id);
+        LOG_ERROR("enqueue_device_register: callable_id=%d not registered", callable_id);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (it->second.host_dlopen_handle != nullptr) {
@@ -1090,9 +1114,18 @@ int DeviceRunnerBase::register_callable_on_device(int32_t callable_id, rtStream_
         control_stream, &reg_args, sizeof(reg_args), host::KernelNames::RegisterCallableName, /*aicpu_num=*/1
     );
     if (rc != 0) {
-        LOG_ERROR("register_callable_on_device: launch_aicpu_payload failed: %d", rc);
+        LOG_ERROR("enqueue_device_register: launch_aicpu_payload failed: %d", rc);
         return rc;
     }
+
+    return 0;
+}
+
+int DeviceRunnerBase::register_callable_on_device(int32_t callable_id, rtStream_t control_stream) {
+    int rc = enqueue_device_register(callable_id, control_stream);
+    if (rc != 0) return rc;
+    const auto &state = callables_.at(callable_id);
+    if (state.host_dlopen_handle != nullptr) return 0;
 
     rc = aclrtSynchronizeStreamWithTimeout(control_stream, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
     if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
@@ -1860,6 +1893,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
         if (allocator_rc != 0 && rc == 0) rc = allocator_rc;
     }
 
+    kernel_callable_cache_.clear();
     block_dim_ = 0;
     worker_count_ = 0;
     // Tied to stream_aicore_, destroyed above: a re-provisioned runner

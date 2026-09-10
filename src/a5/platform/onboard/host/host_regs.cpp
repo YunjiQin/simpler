@@ -19,6 +19,7 @@
 #include "common/platform_config.h"
 #include "common/acl_hal_device.h"
 #include "runtime_c_api.h"
+#include "host/capture_memcpy.h"
 #include "runtime/rt.h"
 #include "ascend_hal.h"  // CANN HAL API definitions
 #include <dlfcn.h>
@@ -127,7 +128,7 @@ int init_aicore_register_addresses(uint64_t *runtime_regs_ptr, uint64_t device_i
     }
 
     // Step 3: Copy register addresses to device memory
-    int ret = rtMemcpy(reg_ptr, regs_size, host_regs.data(), regs_size, RT_MEMCPY_HOST_TO_DEVICE);
+    int ret = capture_memcpy_h2d(reg_ptr, regs_size, host_regs.data(), regs_size);
     if (ret != 0) {
         LOG_ERROR("Failed to copy register addresses to device (rc=%d)", ret);
         allocator.free(reg_ptr);

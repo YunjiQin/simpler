@@ -14,6 +14,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <algorithm>
+
 #include "callable.h"
 #include "callable_protocol.h"
 #include "runtime_c_api.h"
@@ -64,10 +66,9 @@ inline int validate_kernel_init_args(
 }
 
 inline int validate_kernel_prepare_callable_args(
-    const void *ctx, int32_t callable_id, const void *callable, size_t callable_size
+    const void *ctx, const void *callable, size_t callable_size, const int32_t *out_callable_id
 ) {
-    if (ctx == nullptr || callable == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    if (ctx == nullptr || callable == nullptr || out_callable_id == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     if (callable_size < sizeof(ChipCallable)) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     /* ChipCallable's storage_ is CALLABLE_CHILD_ALIGN-aligned relative to the
        header, so a misaligned image puts every child at a misaligned address. */
@@ -96,6 +97,12 @@ inline int validate_kernel_callable_image(const void *callable_image, size_t cal
     if (used > storage_size) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
 
     for (int32_t i = 0; i < callable->child_count_; ++i) {
+        const int32_t func_id = callable->child_func_ids_[i];
+        if (func_id < 0 || func_id >= KERNEL_MAX_FUNC_ID ||
+            std::find(callable->child_func_ids_, callable->child_func_ids_ + i, func_id) !=
+                callable->child_func_ids_ + i) {
+            return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+        }
         if (used > SIZE_MAX - (CALLABLE_ALIGN - 1)) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
         const size_t aligned = (used + CALLABLE_ALIGN - 1) & ~(static_cast<size_t>(CALLABLE_ALIGN) - 1);
         const size_t offset = callable->child_offsets_[i];

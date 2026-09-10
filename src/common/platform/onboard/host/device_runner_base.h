@@ -72,6 +72,7 @@
 #include "host/kernel_entry_validation.h"
 #include "host/child_memory_host_view.h"
 #include "host/kernel_execution_state.h"
+#include "host/kernel_callable_cache.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
 #include "host/runtime_timeout_config.h"
@@ -156,6 +157,8 @@ public:
 
     int init_kernel_context(int device_id);
     int prepare_kernel_callable(int32_t callable_id);
+    KernelCallableCache &kernel_callable_cache() { return kernel_callable_cache_; }
+    KernelCallableCache::Ops kernel_callable_cache_ops();
 
     /** Allocate / free / copy on the per-Worker `MemoryAllocator` + CANN runtime. */
     void *allocate_tensor(std::size_t bytes);
@@ -419,7 +422,7 @@ public:
      * ChipCallable header.
      *
      * Pool-managed: identical buffer bytes (FNV-1a 64-bit content hash)
-     * hit the dedup cache and return the cached chip_dev without
+     * hit the program-mode dedup cache and return the cached chip_dev without
      * reallocating. Each successful upload retains one reference; ownership is
      * transferred into a CallableState or released on registration failure.
      *
@@ -432,6 +435,7 @@ public:
      * @param callable  Host-side ChipCallable pointer.
      * @return Device GM address of the ChipCallable header, or 0 on failure.
      */
+    // Kernel mode consumes the current pending registration upload only.
     uint64_t upload_chip_callable_buffer(const ChipCallable *callable);
     int release_chip_callable_buffer(uint64_t hash);
 
@@ -546,8 +550,8 @@ public:
 
     /**
      * Number of distinct callable_ids the AICPU has been asked to
-     * dlopen for. Monotonically increases when an AICPU load succeeds
-     * during prepare prewarm or first-run fallback; `unregister_callable`
+     * dlopen for. Kernel mode counts accepted enqueues; program mode counts
+     * loads after the registration stream completes. `unregister_callable`
      * does NOT decrement it. So a `prepare → unregister → re-prepare`
      * sequence reports 2 (each AICPU dlopen counted once), even though one cid is
      * currently registered.
@@ -916,6 +920,7 @@ protected:
     void configure_aicore_op_timeout();
 
     PersistentArgsOps persistent_args_ops();
+    int enqueue_device_register(int32_t callable_id, rtStream_t control_stream);
     int register_callable_on_device(int32_t callable_id, rtStream_t control_stream);
 
     /**
@@ -1295,6 +1300,10 @@ protected:
     // This context's execution identity. Write-once: the first init entry to
     // run latches it, and it never changes afterwards.
     ExecutionModeLatch execution_mode_latch_;
+    // Kernel-mode context state. These stay at their default-constructed
+    // values for a program-mode context, and none performs a runtime call
+    // on destruction.
+    KernelCallableCache kernel_callable_cache_;
     KernelExecutionState kernel_exec_state_;
     PersistentKernelArgs persistent_args_;
     Runtime kernel_runtime_;

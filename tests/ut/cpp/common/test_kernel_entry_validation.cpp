@@ -87,38 +87,27 @@ TEST(KernelEntryValidation, InitRejectsEachStructuralViolation) {
     );
 }
 
-TEST(KernelEntryValidation, PrepareCallableChecksIdRangeAndImageSize) {
-    EXPECT_EQ(validate_kernel_prepare_callable_args(kCtx, 0, kCallableImage, sizeof(ChipCallable)), 0);
+TEST(KernelEntryValidation, PrepareCallableChecksOutputPointerAndImageSize) {
+    int32_t id = -1;
+    EXPECT_EQ(validate_kernel_prepare_callable_args(kCtx, kCallableImage, sizeof(ChipCallable), &id), 0);
     EXPECT_EQ(
-        validate_kernel_prepare_callable_args(
-            kCtx, MAX_REGISTERED_CALLABLE_IDS - 1, kCallableImage, sizeof(ChipCallable)
-        ),
-        0
-    );
-    EXPECT_EQ(
-        validate_kernel_prepare_callable_args(nullptr, 0, kCallableImage, sizeof(ChipCallable)),
+        validate_kernel_prepare_callable_args(nullptr, kCallableImage, sizeof(ChipCallable), &id),
         PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
     EXPECT_EQ(
-        validate_kernel_prepare_callable_args(kCtx, 0, nullptr, sizeof(ChipCallable)), PTO_RUNTIME_ERR_INVALID_ARGUMENT
-    );
-    EXPECT_EQ(
-        validate_kernel_prepare_callable_args(kCtx, -1, kCallableImage, sizeof(ChipCallable)),
+        validate_kernel_prepare_callable_args(kCtx, nullptr, sizeof(ChipCallable), &id),
         PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
     EXPECT_EQ(
-        validate_kernel_prepare_callable_args(kCtx, MAX_REGISTERED_CALLABLE_IDS, kCallableImage, sizeof(ChipCallable)),
+        validate_kernel_prepare_callable_args(kCtx, kCallableImage, sizeof(ChipCallable), nullptr),
         PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
     EXPECT_EQ(
-        validate_kernel_prepare_callable_args(kCtx, 0, kCallableImage, sizeof(ChipCallable) - 1),
+        validate_kernel_prepare_callable_args(kCtx, kCallableImage, sizeof(ChipCallable) - 1, &id),
         PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
-    // storage_ sits at a CALLABLE_CHILD_ALIGN offset from the header, so an
-    // image the caller placed off-alignment puts every child off-alignment.
-    static_assert(alignof(ChipCallable) > 1, "a misaligned image must be expressible");
     EXPECT_EQ(
-        validate_kernel_prepare_callable_args(kCtx, 0, kCallableImage + 1, sizeof(ChipCallable)),
+        validate_kernel_prepare_callable_args(kCtx, kCallableImage + 1, sizeof(ChipCallable), &id),
         PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
 }
@@ -149,6 +138,8 @@ TEST(KernelEntryValidation, CallableImageRejectsOutOfRangeChildMetadata) {
 
 TEST(KernelEntryValidation, LaunchChecksPointersAndIdRange) {
     EXPECT_EQ(validate_kernel_launch_args(kCtx, 0, kCallableImage, kStream), 0);
+    EXPECT_EQ(validate_kernel_launch_args(kCtx, 8191, kCallableImage, kStream), 0);
+    EXPECT_EQ(validate_kernel_launch_args(kCtx, 8192, kCallableImage, kStream), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
     EXPECT_EQ(validate_kernel_launch_args(nullptr, 0, kCallableImage, kStream), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
     EXPECT_EQ(validate_kernel_launch_args(kCtx, 0, nullptr, kStream), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
     EXPECT_EQ(validate_kernel_launch_args(kCtx, 0, kCallableImage, nullptr), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
@@ -222,6 +213,24 @@ TEST(KernelArenaGuard, RefusalScanOverCommittedRegionsReleasesNothing) {
         EXPECT_TRUE(arenas[i]->is_committed());
         EXPECT_EQ(arenas[i]->base(), bases[i]);
     }
+}
+
+TEST(KernelEntryValidation, CallableImageRejectsInvalidAndDuplicateChildFunctionIds) {
+    const auto child = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, kBinary, sizeof(kBinary));
+    const int32_t ids[] = {0, 1023};
+    const std::vector<uint8_t> children[] = {child, child};
+    auto image =
+        make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(nullptr, 0, "orch", nullptr, 0, ids, children, 2, "");
+    auto *callable = reinterpret_cast<ChipCallable *>(image.data());
+    EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), 0);
+    for (int32_t id : {-1, 1024, 8191}) {
+        callable->child_func_ids_[1] = id;
+        EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    }
+    callable->child_func_ids_[1] = 0;
+    EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    callable->child_func_ids_[0] = 1023;
+    EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), 0);
 }
 
 }  // namespace

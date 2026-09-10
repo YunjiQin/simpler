@@ -19,6 +19,7 @@
 #include "common/platform_config.h"
 #include "common/acl_hal_device.h"
 #include "runtime_c_api.h"
+#include "host/capture_memcpy.h"
 #include "runtime/rt.h"
 #include "ascend_hal.h"  // CANN HAL API definitions (MODULE_TYPE_AICORE, INFO_TYPE_OCCUPY, etc.)
 #include <chrono>
@@ -225,7 +226,7 @@ int init_aicore_register_addresses(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    int ret = rtMemcpy(reg_ptr, regs_size, host_regs.data(), regs_size, RT_MEMCPY_HOST_TO_DEVICE);
+    int ret = capture_memcpy_h2d(reg_ptr, regs_size, host_regs.data(), regs_size);
     if (ret != 0) {
         LOG_ERROR("Failed to copy %s register addresses to device (rc=%d)", kind_to_name(kind), ret);
         allocator.free(reg_ptr);
