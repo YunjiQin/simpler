@@ -71,6 +71,7 @@
 #include "host/host_phase_run_state.h"
 #include "host/kernel_entry_validation.h"
 #include "host/child_memory_host_view.h"
+#include "host/kernel_execution_state.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
 #include "host/runtime_timeout_config.h"
@@ -79,6 +80,7 @@
 #include "prepare_callable_common.h"
 #include "runtime_c_api.h"
 #include "native_run_execution.h"
+#include "kernel_persistent_args.h"
 
 struct HostApi;  // common/host_api.h — fwd-declared to keep task_interface headers out
 
@@ -148,6 +150,45 @@ public:
      * per-thread device bind off a borrowed device.
      */
     ExecutionModeLatch &execution_mode_latch() { return execution_mode_latch_; }
+
+    /** Context-lifetime streams and events, live only in kernel mode. */
+    KernelExecutionState &kernel_execution_state() { return kernel_exec_state_; }
+
+    /**
+     * Whether any kernel-context owner still holds a device resource: the
+     * streams and events in `KernelExecutionState`, the argument blocks in
+     * `PersistentKernelArgs`, the loaded AICPU binary in `LoadAicpuOp`, or a
+     * retained callable image in `chip_callable_buffers_`. The destruction
+     * guard reads this aggregate, so a close that succeeded for some owners and
+     * failed for another is not a close.
+     *
+     * False on a program context: `chip_callable_buffers_` and the loader are
+     * shared with program registration, and a program context resets its
+     * device at finalize, which ends the generation its addresses and handles
+     * belonged to.
+     */
+    bool kernel_resources_live() const {
+        if (!execution_mode_latch_.is_kernel()) return false;
+        return kernel_exec_state_.has_live_resources() || persistent_args_.has_live_resources() ||
+               load_aicpu_op_.has_live_resources() || !chip_callable_buffers_.empty();
+    }
+
+    /**
+     * Whether a failed release of a callable image keeps its map entry as the
+     * retained owner of the block.
+     *
+     * True only on a kernel context, the only one that can act on such an
+     * entry: `kernel_resources_live()` refuses destruction while one exists,
+     * and `finalize_common_impl` stops before `MemoryAllocator::finalize()` so
+     * an explicit close retries the free. A program context erases the entry
+     * even when the free fails — it resets its device at finalize, so a
+     * retained entry would outlive the generation its address belonged to and
+     * still answer the next generation's dedup lookup.
+     */
+    bool retains_failed_callable_release() const { return execution_mode_latch_.is_kernel(); }
+
+    int init_kernel_context(int device_id);
+    int prepare_kernel_callable(int32_t callable_id);
 
     /** Allocate / free / copy on the per-Worker `MemoryAllocator` + CANN runtime. */
     void *allocate_tensor(std::size_t bytes);
@@ -733,6 +774,8 @@ public:
      */
     virtual int finalize() = 0;
 
+    virtual int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) = 0;
+
     /**
      * Arm or disarm this thread's host-side dep_gen capture, from the run's own
      * config, before it binds.
@@ -925,6 +968,9 @@ protected:
      */
     void configure_aicore_op_timeout();
 
+    PersistentArgsOps persistent_args_ops();
+    int register_callable_on_device(int32_t callable_id, rtStream_t control_stream);
+
     /**
      * Load AICPU SO and initialize device args. Called from
      * `ensure_device_initialized()` after the persistent streams are
@@ -933,7 +979,7 @@ protected:
      *
      * @return 0 on success, error code on failure.
      */
-    int ensure_binaries_loaded();
+    int ensure_binaries_loaded(rtStream_t control_stream);
 
     /**
      * Initial launch of `simpler_aicpu_init`, latching the invariants (orch
@@ -944,7 +990,7 @@ protected:
      *
      * @return 0 on success, error code on failure.
      */
-    int ensure_aicpu_init_launched();
+    int ensure_aicpu_init_launched(rtStream_t control_stream);
 
     /**
      * Provision the async-DMA workspaces this Worker asked for (see
@@ -1179,6 +1225,25 @@ protected:
      * @return 0 on success, first nonzero rc encountered otherwise.
      */
     int finalize_common();
+
+    /**
+     * Retire loader state that a completed device reset has invalidated.
+     *
+     * `LoadAicpuOp::Finalize()` keeps its binary handle when `rtsBinaryUnload`
+     * fails, so that an owner able to retry it survives. A program close then
+     * resets the device, which ends the generation that handle belonged to:
+     * from that point a retry would unload a handle into a dead generation,
+     * `Init` would refuse a re-init over a binary that no longer exists, and
+     * the destructor would attempt a third unload. Calling this after a
+     * confirmed reset is what keeps `init -> finalize -> init` working on one
+     * context. A kernel close resets nothing and must not call it.
+     */
+    void retire_loader_after_device_reset() {
+        if (!load_aicpu_op_.has_live_resources()) return;
+        LOG_WARN("finalize: device reset ended the generation of the retained AICPU binary handle; forgetting it");
+        load_aicpu_op_.ForgetWithoutUnload();
+    }
+
     void release_graph_definition_blocks();
 
     /** Drop every retained host SM mirror, returning its pages to the allocator. */
@@ -1225,6 +1290,11 @@ protected:
         uint64_t chip_dev{0};  // device GM address of the ChipCallable header
         size_t total_size{0};  // byte size of the device allocation
         int refcount{0};
+        // The entry exists only so a release whose free failed still has an
+        // owner to retry through, and names no callable a caller may use: its
+        // contents either never reached the device or are already released. The
+        // dedup lookup skips it, and finalize retries the free.
+        bool release_pending{false};
     };
     std::unordered_map<uint64_t, ChipCallableBuffer> chip_callable_buffers_;
 
@@ -1302,6 +1372,9 @@ protected:
     // This context's execution identity. Write-once: the first init entry to
     // run latches it, and it never changes afterwards.
     ExecutionModeLatch execution_mode_latch_;
+    KernelExecutionState kernel_exec_state_;
+    PersistentKernelArgs persistent_args_;
+    Runtime kernel_runtime_;
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};  // Stored for print_handshake_results

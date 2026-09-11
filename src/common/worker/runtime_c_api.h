@@ -245,8 +245,13 @@ DeviceContextHandle create_device_context(void);
 /**
  * Destroy a device context created by create_device_context().
  * The caller must finalize every prepared native run and call
- * finalize_device() first. An active native run makes this operation log an
- * error and leave the context alive; otherwise it frees the underlying object.
+ * finalize_device() first. Two conditions make this operation log an error and
+ * leave the context alive: an active native run, and a kernel context that
+ * still owns a device resource because its close reported failure — that one is
+ * deliberately leaked, since destroying it would free handles a captured
+ * ACLGraph may still reference. This entry returns void, so the caller learns
+ * of a refusal from the failing finalize_device(), not from here; otherwise it
+ * frees the underlying object.
  */
 void destroy_device_context(DeviceContextHandle ctx);
 
@@ -551,10 +556,12 @@ size_t get_run_stream_set_create_count(DeviceContextHandle ctx);
  * exclusive-device path driven through the prepared-run family
  * above. simpler_kernel_mode_init latches kernel mode, which borrows the
  * caller's already-current device and caller-owned stream to enqueue one
- * bounded asynchronous operator per launch: no device reset, no internal
- * stream/device synchronize on the prepare/launch/close paths, zero
- * allocation at launch, and no capture/model-state queries, so a launch is
- * capturable by ACLGraph as an ordinary node.
+ * bounded asynchronous operator per launch: no device reset, no caller-stream
+ * or device synchronize on any path, zero allocation at launch, and no
+ * capture/model-state queries, so a launch is capturable by ACLGraph as an
+ * ordinary node. Cold-path bring-up and registration do synchronize a
+ * context-owned stream — both run outside capture; the launch path
+ * synchronizes nothing at all.
  *
  * Identity is a write-once property of the context, not a state that evolves:
  * ExecutionModeLatch on the platform runner holds it, the first init entry to
@@ -599,6 +606,12 @@ size_t get_run_stream_set_create_count(DeviceContextHandle ctx);
 /**
  * Return nonzero when this runtime can execute kernel-mode launches.
  *
+ * Launches, not resources: it stays zero while simpler_kernel_mode_launch is a
+ * rejecting stub, including on a runtime whose simpler_kernel_mode_init already
+ * establishes a kernel context. Whether a runtime has kernel-mode resource
+ * sizing at all is answered by that init, which refuses with
+ * PTO_RUNTIME_ERR_UNSUPPORTED and establishes nothing when it does not.
+ *
  * This is the capability question a caller asks before choosing between the
  * kernel-mode entries and the program-mode prepared-run family. It is callable
  * on a context that create_device_context() has returned but that no init has
@@ -617,19 +630,34 @@ int simpler_kernel_mode_supported(DeviceContextHandle ctx);
  * with the program-mode simpler_init — and the latch controls the
  * kernel-mode guards on the platform's device/ACL lifecycle and arena paths.
  *
- * Takes no device ownership: no device reset, no ACL init/finalize, and no
- * stream or device synchronize on this path. Creates only context-owned
- * persistent handles used by asynchronous preparation and launch. `config`
- * is context-static; launches never mutate it. `context_generation` is a
- * nonzero host-process-unique identity minted by the caller for sequential
- * contexts; generation zero is invalid.
+ * Takes no device ownership: no device reset and no ACL init/finalize. Creates
+ * only context-owned persistent handles used by asynchronous preparation and
+ * launch. Cold-path bring-up may synchronize a context-owned stream — the AICPU
+ * init handshake does — but never a caller stream and never the device; the
+ * launch path synchronizes nothing at all. `config` is read here for capacity
+ * and resident-resource sizing only; it also carries per-call execution and
+ * diagnostic settings, and treating the whole struct as context-static is a
+ * property of this compatibility entry rather than of the configuration
+ * itself. Separating the two — and resolving the per-call half per preparation
+ * — belongs to the preparation entry that does not exist yet.
+ * `context_generation` is a nonzero host-process-unique identity minted by the
+ * caller for sequential contexts; generation zero is invalid.
  *
  * Structural argument errors and invalid TMR sizing configurations return
  * PTO_RUNTIME_ERR_INVALID_ARGUMENT. Invalid generated resource contracts or
  * C++ exceptions during admission return PTO_RUNTIME_ERR_INTERNAL.
- * The current TMR/HBG implementations return PTO_RUNTIME_ERR_UNSUPPORTED
- * after successful admission or when no kernel contract is available;
- * neither case establishes kernel resources or changes the context's mode.
+ * A runtime that cannot size kernel-mode resources — today host_build_graph,
+ * and every simulated variant — returns PTO_RUNTIME_ERR_UNSUPPORTED and
+ * establishes nothing: that refusal is the capability gate on this path, so it
+ * ends the call before the mode latch is taken.
+ *
+ * Success establishes this context's cold-path resources and latches kernel
+ * mode. It does not mean kernel-mode launches are available:
+ * simpler_kernel_mode_supported() answers that question and stays zero while
+ * simpler_kernel_mode_launch is a rejecting stub. Nor does it retain the
+ * validated contract or resolve per-preparation configuration — the contract
+ * is validated and discarded, and `context_generation` is checked for being
+ * nonzero and not yet given a retained lifecycle.
  */
 int simpler_kernel_mode_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
@@ -644,13 +672,15 @@ int simpler_kernel_mode_init(
  * `callable_size` bytes. Validating every flexible-array offset before the
  * image is hashed or uploaded is the implementation's obligation; the shared
  * entry validation checks only the image's alignment, its size floor, and the
- * callable id range. Preparation may allocate persistent state and
- * enqueue asynchronous device work on `caller_stream`, but never synchronizes
- * a stream or device — preparation errors surface through the caller's own
- * warmup + synchronize. The stream is borrowed for this call only.
+ * callable id range. Preparation may allocate persistent state and enqueue
+ * asynchronous device work on context-owned streams. Registration synchronizes
+ * its internal AICPU control stream before committing the callable, but never
+ * synchronizes a caller stream or the device. Preparation neither accepts nor
+ * retains a caller stream; the current caller/capture stream is supplied
+ * independently to each launch.
  */
 int simpler_kernel_mode_prepare_callable(
-    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size, void *caller_stream
+    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size
 );
 
 /**
