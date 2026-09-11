@@ -35,7 +35,6 @@ struct FakeContextOps {
     int events_created{0};
     int events_destroyed{0};
     uintptr_t next_handle{1};
-
     static FakeContextOps *self(void *context) { return static_cast<FakeContextOps *>(context); }
 
     static int get_current_device(void *context, int *device_id) noexcept {
@@ -86,6 +85,45 @@ struct FakeContextOps {
 constexpr size_t kStreamCount = static_cast<size_t>(KernelStreamKind::Count);
 constexpr size_t kEventCount = static_cast<size_t>(KernelEventKind::Count);
 
+class KernelContextCreationFailure : public ::testing::TestWithParam<int> {};
+
+TEST_P(KernelContextCreationFailure, EveryCreationPointRollsBackAndCanRetry) {
+    FakeContextOps fake;
+    const int point = GetParam();
+    if (point < static_cast<int>(kStreamCount)) {
+        fake.create_stream_rc_after = point;
+    } else {
+        fake.create_event_rc_after = point - kStreamCount;
+    }
+    KernelExecutionState state;
+    EXPECT_NE(state.initialize(3, fake.table()), 0);
+    EXPECT_EQ(state.phase(), KernelContextPhase::New);
+    EXPECT_FALSE(state.has_live_resources());
+    EXPECT_EQ(fake.streams_created, fake.streams_destroyed);
+    EXPECT_EQ(fake.events_created, fake.events_destroyed);
+    EXPECT_EQ(fake.streams_created + fake.events_created, point);
+    fake.create_stream_rc_after = -1;
+    fake.create_event_rc_after = -1;
+    ASSERT_EQ(state.initialize(3, fake.table()), 0);
+    EXPECT_EQ(state.close(), 0);
+    EXPECT_EQ(fake.streams_created, fake.streams_destroyed);
+    EXPECT_EQ(fake.events_created, fake.events_destroyed);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    AllStreamsAndEvents, KernelContextCreationFailure, ::testing::Range(0, static_cast<int>(kStreamCount + kEventCount))
+);
+
+TEST(KernelExecutionState, DestructionWithoutCloseMakesNoRuntimeCalls) {
+    FakeContextOps fake;
+    {
+        KernelExecutionState state;
+        ASSERT_EQ(state.initialize(3, fake.table()), 0);
+    }
+    EXPECT_EQ(fake.streams_destroyed, 0);
+    EXPECT_EQ(fake.events_destroyed, 0);
+}
+
 TEST(KernelContextOpsVocabulary, IncompleteTableIsInvalid) {
     FakeContextOps fake;
     KernelContextOps ops = fake.table();
@@ -122,6 +160,7 @@ TEST(ExecutionModeLatch, ModesAreMutuallyExclusiveInBothDirections) {
 
     ExecutionModeLatch kernel;
     EXPECT_EQ(kernel.latch(SIMPLER_MODE_KERNEL), 0);
+    EXPECT_EQ(kernel.latch(SIMPLER_MODE_KERNEL), 0);
     EXPECT_EQ(kernel.latch(SIMPLER_MODE_PROGRAM), PTO_RUNTIME_ERR_INVALID_STATE);
     EXPECT_TRUE(kernel.is_kernel());
 }
@@ -147,7 +186,12 @@ TEST(KernelExecutionState, EmptyContextInitThenCloseIsClean) {
     EXPECT_EQ(state.device_id(), 3);
     EXPECT_EQ(fake.streams_created, static_cast<int>(kStreamCount));
     EXPECT_EQ(fake.events_created, static_cast<int>(kEventCount));
-    EXPECT_TRUE(state.has_live_resources());
+    for (size_t i = 0; i < kStreamCount; ++i) {
+        EXPECT_NE(state.hidden_stream(static_cast<KernelStreamKind>(i)), nullptr);
+    }
+    for (size_t i = 0; i < kEventCount; ++i) {
+        EXPECT_NE(state.event(static_cast<KernelEventKind>(i)), nullptr);
+    }
 
     EXPECT_EQ(state.close(), 0);
     EXPECT_EQ(state.phase(), KernelContextPhase::Closed);

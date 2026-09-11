@@ -33,6 +33,12 @@ struct KernelContextOps {
     int (*get_current_device)(void *context, int *device_id) noexcept {nullptr};
     int (*create_hidden_stream)(void *context, void **stream) noexcept {nullptr};
     int (*destroy_hidden_stream)(void *context, void *stream) noexcept {nullptr};
+    /**
+     * Creation flag every context event is born with, forwarded verbatim to
+     * create_event. The platform constant it carries is knowledge of whoever
+     * builds this table; KernelExecutionState only relays it, so a host-only
+     * test observes the flag the platform actually asked for.
+     */
     int (*create_event)(void *context, void **event) noexcept {nullptr};
     int (*destroy_event)(void *context, void *event) noexcept {nullptr};
 
@@ -79,24 +85,39 @@ enum class KernelContextPhase : uint8_t {
     Closed,
 };
 
+/**
+ * The two streams a context creates and owns. Only Aicore is hidden in the
+ * capture sense; Aicpu is a dedicated private stream. Neither is the caller's.
+ */
 enum class KernelStreamKind : uint8_t {
     Aicpu = 0,
     Aicore,
     Count,
 };
 
+/**
+ * One event per edge of the chained caller ↔ aicpu ↔ aicore synchronization,
+ * plus the call tail. Caller and aicore are never adjacent, so no event joins
+ * them directly.
+ *
+ * AicoreStart is recorded on the aicpu stream *before* the AICPU launch: the
+ * AICPU orchestrator spins on AICore's handshake report, so an AicoreStart
+ * recorded after the launch could only fire once the AICPU task completed,
+ * which is a deadlock.
+ */
 enum class KernelEventKind : uint8_t {
-    PrepareTail = 0,
-    Start,
-    AicoreDone,
-    SerialTail,
+    Start = 0,   /* caller → aicpu fork */
+    AicoreStart, /* aicpu → aicore fork */
+    AicoreDone,  /* aicore → aicpu join */
+    AicpuDone,   /* aicpu → caller join */
+    SerialTail,  /* caller-visible call tail; the stream-switch gate reads it */
     Count,
 };
 
 /**
  * Context-lifetime state for the borrowed kernel execution mode.
  *
- * This object owns the persistent hidden stream pair and event set; every
+ * This object owns the dedicated AICPU stream, hidden AICore stream and event set; every
  * graph-visible persistent execution resource belongs here rather than in a
  * per-invocation object. The caller stream is never stored or destroyed —
  * each launch receives it as a borrowed argument.
@@ -125,9 +146,10 @@ enum class KernelEventKind : uint8_t {
  *
  * The destructor performs no runtime calls. If a caller skips explicit close
  * while an ACLGraph can still reference these handles, freeing them would be
- * a use-after-free, so the handles leak instead. The owner must retire graph
- * references and wait for queued uses to finish before close(), then keep
- * this object alive until close() succeeds.
+ * a use-after-free, so the handles leak instead. Refusing to destroy an
+ * unclosed kernel runner is the public C API's half of that contract:
+ * destroy_device_context refuses while this object owns stream/event handles
+ * or the runner has an outstanding native run.
  */
 class KernelExecutionState {
 public:
@@ -147,6 +169,8 @@ public:
     int last_runtime_error() const;
     int unexpected_teardown_error() const;
     bool has_live_resources() const;
+    void *hidden_stream(KernelStreamKind kind) const;
+    void *event(KernelEventKind kind) const;
 
 private:
     int cleanup_owned_resources_locked();

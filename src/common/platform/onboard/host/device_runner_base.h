@@ -68,6 +68,7 @@
 #include "host/host_phase_records.h"
 #include "host/execution_mode_latch.h"
 #include "host/kernel_entry_validation.h"
+#include "host/kernel_execution_state.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
 #include "host/runtime_timeout_config.h"
@@ -76,6 +77,7 @@
 #include "prepare_callable_common.h"
 #include "runtime_c_api.h"
 #include "native_run_execution.h"
+#include "kernel_persistent_args.h"
 
 struct HostApi;  // common/host_api.h — fwd-declared to keep task_interface headers out
 
@@ -145,6 +147,12 @@ public:
      * per-thread device bind off a borrowed device.
      */
     ExecutionModeLatch &execution_mode_latch() { return execution_mode_latch_; }
+
+    /** Context-lifetime streams and events, live only in kernel mode. */
+    KernelExecutionState &kernel_execution_state() { return kernel_exec_state_; }
+
+    int init_kernel_context(int device_id);
+    int prepare_kernel_callable(int32_t callable_id);
 
     /** Allocate / free / copy on the per-Worker `MemoryAllocator` + CANN runtime. */
     void *allocate_tensor(std::size_t bytes);
@@ -670,6 +678,8 @@ public:
      */
     virtual int finalize() = 0;
 
+    virtual int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) = 0;
+
     /**
      * dep_gen enablement setter. The shared c_api `simpler_run` calls this
      * unconditionally; a2a3 and a5 override it to capture submit_task inputs.
@@ -844,6 +854,9 @@ protected:
      */
     void configure_aicore_op_timeout();
 
+    PersistentArgsOps persistent_args_ops();
+    int register_callable_on_device(int32_t callable_id, rtStream_t control_stream);
+
     /**
      * Load AICPU SO and initialize device args. Called from
      * `ensure_device_initialized()` after the persistent streams are
@@ -852,7 +865,7 @@ protected:
      *
      * @return 0 on success, error code on failure.
      */
-    int ensure_binaries_loaded();
+    int ensure_binaries_loaded(rtStream_t control_stream);
 
     /**
      * Initial launch of `simpler_aicpu_init`, latching the invariants (orch
@@ -863,7 +876,7 @@ protected:
      *
      * @return 0 on success, error code on failure.
      */
-    int ensure_aicpu_init_launched();
+    int ensure_aicpu_init_launched(rtStream_t control_stream);
 
     /**
      * Provision the async-DMA workspaces this Worker asked for (see
@@ -1218,6 +1231,9 @@ protected:
     // This context's execution identity. Write-once: the first init entry to
     // run latches it, and it never changes afterwards.
     ExecutionModeLatch execution_mode_latch_;
+    KernelExecutionState kernel_exec_state_;
+    PersistentKernelArgs persistent_args_;
+    Runtime kernel_runtime_;
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};  // Stored for print_handshake_results

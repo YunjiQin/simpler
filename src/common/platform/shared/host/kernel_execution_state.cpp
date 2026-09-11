@@ -150,6 +150,16 @@ bool KernelExecutionState::has_live_resources() const {
     return has_live_resources_locked();
 }
 
+void *KernelExecutionState::hidden_stream(KernelStreamKind kind) const {
+    std::scoped_lock lock(mutex_);
+    return hidden_streams_.at(static_cast<size_t>(kind));
+}
+
+void *KernelExecutionState::event(KernelEventKind kind) const {
+    std::scoped_lock lock(mutex_);
+    return events_.at(static_cast<size_t>(kind));
+}
+
 bool KernelExecutionState::has_live_resources_locked() const {
     for (void *stream : hidden_streams_) {
         if (stream != nullptr) return true;
