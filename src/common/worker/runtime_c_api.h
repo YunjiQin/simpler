@@ -626,13 +626,15 @@ int simpler_kernel_mode_init(
  * `callable_size` bytes. Validating every flexible-array offset before the
  * image is hashed or uploaded is the implementation's obligation; the shared
  * entry validation checks only the image's alignment, its size floor, and the
- * callable id range. Preparation may allocate persistent state and
- * enqueue asynchronous device work on `caller_stream`, but never synchronizes
- * a stream or device — preparation errors surface through the caller's own
- * warmup + synchronize. The stream is borrowed for this call only.
+ * callable id range. Preparation may allocate persistent state and enqueue
+ * asynchronous device work on context-owned streams. Registration synchronizes
+ * its internal AICPU control stream before committing the callable, but never
+ * synchronizes a caller stream or the device. Preparation neither accepts nor
+ * retains a caller stream; the current caller/capture stream is supplied
+ * independently to each launch.
  */
 int simpler_kernel_mode_prepare_callable(
-    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size, void *caller_stream
+    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size
 );
 
 /**
