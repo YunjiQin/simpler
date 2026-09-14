@@ -34,14 +34,7 @@ struct KernelContextOps {
     int (*get_current_device)(void *context, int *device_id) noexcept {nullptr};
     int (*create_hidden_stream)(void *context, void **stream) noexcept {nullptr};
     int (*destroy_hidden_stream)(void *context, void *stream) noexcept {nullptr};
-    /**
-     * Creation flag every context event is born with, forwarded verbatim to
-     * create_event. The platform constant it carries is knowledge of whoever
-     * builds this table; KernelExecutionState only relays it, so a host-only
-     * test observes the flag the platform actually asked for.
-     */
-    uint32_t event_flag{0};
-    int (*create_event)(void *context, uint32_t flag, void **event) noexcept {nullptr};
+    int (*create_event)(void *context, void **event) noexcept {nullptr};
     int (*destroy_event)(void *context, void *event) noexcept {nullptr};
 
     bool valid() const {

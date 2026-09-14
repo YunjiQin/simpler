@@ -36,7 +36,6 @@ loads host_build_graph, which every a2a3 build produces.
 from __future__ import annotations
 
 import multiprocessing as mp
-import os
 import traceback
 
 import pytest
@@ -155,13 +154,20 @@ def _run_case(case: str, device_id: int, platform: str, queue) -> None:
         result["error"] = f"{type(exc).__name__}: {exc}"
         result["traceback"] = traceback.format_exc()
     finally:
+        # Destroying the stream is the one operation that touches it *after*
+        # kernel_init ran, so it is the evidence that the borrowed stream came
+        # through intact. Swallowing its failure here would let a kernel_init
+        # that destroyed or invalidated the caller's stream still report ok.
         if stream:
             try:
                 import _task_interface as native
 
                 native._acl_destroy_stream(stream)
-            except Exception:  # noqa: BLE001, S110
-                pass
+                result["stream_destroyed"] = True
+            except BaseException as exc:  # noqa: BLE001
+                result["stream_destroyed"] = False
+                result["stream_teardown_error"] = f"{type(exc).__name__}: {exc}"
+                result["ok"] = False
         queue.put(result)
 
 
@@ -171,7 +177,15 @@ def _run_in_subprocess(case: str, device_id: int, platform: str) -> dict:
     proc = ctx.Process(target=_run_case, args=(case, device_id, platform, queue))
     proc.start()
     proc.join(timeout=300)
-    assert proc.exitcode is not None, f"case {case} did not exit within 300s"
+    if proc.is_alive():
+        # A hung child is non-daemon, so failing without reaping it would leave
+        # the test process waiting on it until the CI job timeout.
+        proc.terminate()
+        proc.join(timeout=10)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
+        pytest.fail(f"case {case} did not exit within 300s")
     assert not queue.empty(), f"case {case} produced no result (exitcode={proc.exitcode})"
     return queue.get()
 
@@ -213,4 +227,9 @@ def test_borrowed_stream_survives_a_refused_kernel_init(st_platform, st_device_i
     result = _run_in_subprocess("init_refused", int(st_device_ids[0]), st_platform)
     assert result.get("stream_nonzero"), f"test never obtained a stream: {result}"
     assert result["ok"], f"refused init did not behave per contract: {result}"
-    assert os.path.exists("/proc/self"), "sanity: subprocess reported back to a live parent"
+    # The assertion that makes this case distinct from init_refused: an
+    # operation on the stream issued after the failed init has to succeed.
+    assert result.get("stream_destroyed") is True, (
+        f"the caller's stream did not survive a refused kernel_init: {result}"
+    )
+    assert "stream_teardown_error" not in result, f"post-init stream operation failed: {result}"

@@ -509,3 +509,104 @@ any producer.
 
 **Affects.** #2064 (final contract adopted), #2189 and #2190 (error-code
 numbers), #2193 (bank kept over the merged guard), #2185 (symbol resolution).
+
+---
+
+## D15 - Re-survey the PR heads; take only what does not re-open a decision
+
+**Problem.** The heads this integration was audited against were frozen on
+2026-09-11. Since then #2064 merged to `main`, `main` advanced four commits
+past the integration base `748c39fb`, and six of the remaining thirteen PRs
+moved. A head that moved is not automatically a change to adopt: some of the
+movement is a rebase over the merged K1, and some of it reverses a decision
+this log already made.
+
+**Finding.** Seven PRs are byte-identical to their audited heads: #2173,
+\#2174, #2175, #2180, #2187, #2189 and #2193. The six that moved divide
+cleanly:
+
+| PR | What moved | Re-opens a decision? |
+| -- | ---------- | -------------------- |
+| #2177 | Invalid `CallConfig` now returns `INVALID_ARGUMENT`, not `INTERNAL` | no |
+| #2176 | `KernelContextOps` drops `event_flag`; `create_event` takes `(context, event)` | no |
+| #2176 | Failed-rollback retention test; `rtFree` fault hook and `arm_destroy_failure_after` | no |
+| #2176 | Header states a capture-boundary rule that forbids a prepare-published tail | **yes** — D9 |
+| #2185 | Test reaps a hung child; asserts the borrowed stream survives a refused init | no |
+| #2185 | `prepare_callable` drops `caller_stream` (five parameters to four) | **yes** — D3 |
+| #2190 | `SimplerCallableHandle` and the per-callable generation removed; block allocator; resolve by index | **yes** — D7, D8 |
+| #2171, #2172 | H1 and 2B restructured around new `graph_definition_pack.{h,cpp}`, `kernel_pipeline_contract.h`, `kernel_resource_plan.h` | **yes** — D2, D11 |
+
+**Choice.** Adopt the four rows marked "no". Leave the rest for a decision
+pass that can weigh each on its merits, and record here what that pass has to
+answer.
+
+Adopted:
+
+1. **#2177's error codes.** `build_kernel_pipeline_contract_impl` returns
+   `INVALID_ARGUMENT` for a null or unresolvable `CallConfig` and keeps
+   `INTERNAL` for a null output or a contract it generated but cannot
+   validate. Both arch TMR runtime makers, the header's contract comment,
+   `test_trb_runtime_temp_buffer.cpp` and `test_pipeline_contract_loader.cpp`
+   move together. This continues D14 rather than re-opening it: D14 adopted
+   the merged K1 numbering for the entry points, and this extends the same
+   numbering to the hook behind them.
+2. **#2176's `event_flag` removal.** The flag existed so a host-only test
+   could observe which constant the platform asked for. The platform's own
+   `create_event` is a better place for that knowledge, and the test that
+   read the field goes with it.
+3. **#2176's fault coverage.** `PersistentKernelArgs` already rolls back
+   through `finalize_once` on this line, but nothing exercised a rollback
+   whose own release fails. The new test and the `rtFree` hook behind
+   `persistent_free_close` cover the owner to `finalize_common` to allocator
+   retry chain.
+4. **#2185's test hardening.** A hung non-daemon child is terminated instead
+   of left for the CI job timeout, and destroying the borrowed stream after a
+   refused `kernel_init` is now an assertion rather than a swallowed
+   exception. Only the hardening is taken; the signature change it accompanies
+   is deferred below.
+
+**Not applicable here.** #2176, #2177 and #2185 all drop
+`kernel_execution_state.cpp` from a platform source list, because on their
+lines nothing outside K2 consumes it. On this line
+`kernel_resource_requirements.h` calls `bind_resources_for_launch` from the
+H chain, so both the onboard and the simulation host runtimes need the
+translation unit; removing it from the simulation lists leaves
+`libhost_runtime.so` with an undefined symbol that `test_pipeline_contract_loader`
+catches at `dlopen`.
+
+**Deferred, and what each needs.**
+
+- **D3, `prepare_callable`'s stream parameter.** D3's first reason was that
+  the entry layer, #2185, called the five-parameter form and K2 was the
+  outlier. #2185 has since moved to four, so the count is now #2176, #2180,
+  #2185 and #2189 for four against #2177 and #2193 for five. D3's remaining
+  reasons — the K1 freeze card, expressiveness, symmetry with launch — are
+  untouched by the move, so the decision may still stand; but its stated
+  evidence no longer supports it and it has to be re-argued rather than
+  assumed.
+- **D7 and D8, the callable generation.** D7 kept `int32_t callable_id` on
+  both entries specifically because the generation guard was "the valuable
+  half of #2190" and survived the collapse. That half no longer exists in
+  #2190: there is no `generation` on a residency, `resolve` indexes
+  `entries_` directly, and `CALLABLE_STALE` has no producer. Adopting the new
+  cache means deciding whether this line keeps a guard its source has
+  dropped.
+- **D9 and the capture boundary.** #2176's header now records that a wait
+  issued during capture on an event recorded before capture is rejected by
+  CANN as 107024, and concludes that preparation must not publish a tail for a
+  later captured launch to consume. This line does exactly that:
+  `prepare_callable` records `PrepareTail` on the control stream, and
+  `kernel_prepare_pending_` makes the next launch wait on it
+  (`kernel_launch_sequence.h`, `KernelLaunchStep::PrepareWait`). If the note
+  is right, a first launch that is captured fails, and the five-event topology
+  D9 chose needs a fourth event or a different ordering. Adopting the note
+  without changing the topology would only document a contradiction, so both
+  move together or neither does.
+- **D2 and D11, the H chain.** #2171 and #2172 were force-pushed onto a
+  different decomposition: a `GraphDefinitionPack` with its own translation
+  unit, and `kernel_resource_plan.h` where this line has
+  `kernel_resource_requirements.h`. Re-integrating them is a rewrite of the
+  H contribution, not a patch to it.
+
+**Affects.** #2176, #2177, #2185 (partially adopted); #2171, #2172, #2190
+(deferred in full); D2, D3, D7, D8, D9, D11 (flagged for re-adjudication).

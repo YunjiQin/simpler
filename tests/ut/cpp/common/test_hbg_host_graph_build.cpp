@@ -668,8 +668,7 @@ struct ResourceContextPlatform {
             [](void *, void *) noexcept {
                 return 0;
             },
-            0,
-            [](void *ctx, uint32_t, void **event) noexcept {
+            [](void *ctx, void **event) noexcept {
                 *event = reinterpret_cast<void *>(static_cast<ResourceContextPlatform *>(ctx)->next_handle++);
                 return 0;
             },

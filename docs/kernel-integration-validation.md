@@ -3,25 +3,31 @@
 ## Scope and frozen PR heads
 
 This records local integration of every submitted PR in the supplied kernel
-pipeline. It does not merge or change the GitHub PRs. The final audit froze
-these heads on 2026-09-11; later PR updates are outside this validation run.
+pipeline. It does not merge or change the GitHub PRs. The first audit froze
+these heads on 2026-09-11; the heads were re-surveyed on 2026-09-14, and the
+"Now" column is what each PR carried then. A head that moved is not by itself
+a change this line took — D15 in the integration log says which of the moves
+were adopted and which were deferred.
 
-| PR | Contribution | Audited head |
-| -- | ------------ | ------------ |
-| #2064 | K1 ABI, lifecycle, invocation header, scalar signature | `2ab04b1b1ef76a88743950a4f3e6c78d1bd8be26` |
-| #2171 | H1 host graph build and H2D separation | `458c0243ccdb9933c9c4bf3928021f83c446b117` |
-| #2172 | HBG resources and stream contract | `7523052fee0066c0d289a688b48f76b10c7d54ab` |
-| #2173 | HBG context resource preparation and freeze | `15741ac05b24908c71703c72f2549f5fe0e9fa53` |
-| #2174 | H2 immutable graph packets | `1fe6bf53f0af9b6a02eeb2edff080a8bc7e7467a` |
-| #2175 | H3 execution slot sealing and validation | `89b00a9cad3bdc32dee3ec2ab1a65d21a8a23c20` |
-| #2176 | K2 persistent execution resources and capture test | `533f67a13f4c11a02face67a4fc8609926b71ef8` |
-| #2177 | TMR resource contract and initialization admission | `2153406a0420e8de17cf7397d30864939b1bca0c` |
-| #2180 | K4 per-invocation snapshots | `b0943525dd8eaeb486bca92bbf5480a37eb61fcb` |
-| #2185 | C++, nanobind and Python kernel entry points | `32dd9442f79bb936541cf41a6a08d7838d450134` |
-| #2187 | Three-stream launch binder and compensation | `136e9712d22c495ac921a6900c8f24fa9b8ebcf3` |
-| #2189 | K5 resident and per-invocation execution state | `b6435e4858b1e0443966d664cca478276baefa55` |
-| #2190 | Callable cache, residency and generation validation | `2c876478dbf41fad5c0019f081261d912e9b687e` |
-| #2193 | K3 capacity refusal without releasing existing resources | `b8e739d9d8143ca6f35bf2177241976f900e2ab7` |
+| PR | Contribution | Audited head (2026-09-11) | Now (2026-09-14) |
+| -- | ------------ | ------------------------- | ---------------- |
+| #2064 | K1 ABI, lifecycle, invocation header, scalar signature | `2ab04b1b1ef76a88743950a4f3e6c78d1bd8be26` | merged to `main` as `1d1ddc815` |
+| #2171 | H1 host graph build and H2D separation | `458c0243ccdb9933c9c4bf3928021f83c446b117` | `caf9d9dae7f4` — restructured, deferred |
+| #2172 | HBG resources and stream contract | `7523052fee0066c0d289a688b48f76b10c7d54ab` | `f182ec80e801` — restructured, deferred |
+| #2173 | HBG context resource preparation and freeze | `15741ac05b24908c71703c72f2549f5fe0e9fa53` | unchanged |
+| #2174 | H2 immutable graph packets | `1fe6bf53f0af9b6a02eeb2edff080a8bc7e7467a` | unchanged |
+| #2175 | H3 execution slot sealing and validation | `89b00a9cad3bdc32dee3ec2ab1a65d21a8a23c20` | unchanged |
+| #2176 | K2 persistent execution resources and capture test | `533f67a13f4c11a02face67a4fc8609926b71ef8` | `abbe07f53cfa` — partially adopted |
+| #2177 | TMR resource contract and initialization admission | `2153406a0420e8de17cf7397d30864939b1bca0c` | `b569474b2833` — adopted |
+| #2180 | K4 per-invocation snapshots | `b0943525dd8eaeb486bca92bbf5480a37eb61fcb` | unchanged |
+| #2185 | C++, nanobind and Python kernel entry points | `32dd9442f79bb936541cf41a6a08d7838d450134` | `7058de9f9f4d` — partially adopted |
+| #2187 | Three-stream launch binder and compensation | `136e9712d22c495ac921a6900c8f24fa9b8ebcf3` | unchanged |
+| #2189 | K5 resident and per-invocation execution state | `b6435e4858b1e0443966d664cca478276baefa55` | unchanged |
+| #2190 | Callable cache, residency and generation validation | `2c876478dbf41fad5c0019f081261d912e9b687e` | `5f9895d7c0e4` — generation model dropped, deferred |
+| #2193 | K3 capacity refusal without releasing existing resources | `b8e739d9d8143ca6f35bf2177241976f900e2ab7` | unchanged |
+
+The two audited HBG heads were force-pushed away and are no longer fetchable;
+their contributions on this line are the ones the 2026-09-11 audit integrated.
 
 Conflicting contracts and adaptations are explained in
 [the integration log](../INTEGRATION-LOG.md). Tests exercise the integrated
@@ -167,6 +173,48 @@ same device while the first stays initialized.
 | a2a3 SDMA scenes | 3 passed |
 | a2a3sim scenes | 82 passed, 8 skipped |
 | a5sim scenes | 78 passed |
+
+## PR refresh revalidation (2026-09-14)
+
+`main` was merged into the integration line, bringing it to `5186d8c7`, and the
+four adopted changes from D15 were applied on top. Hardware work passed the
+architecture precheck and acquired devices through `task-submit --device auto`.
+
+| Suite | Result |
+| ----- | ------ |
+| C++ unit tests, no hardware | 166/166 passed |
+| C++ unit tests with `SIMPLER_ENABLE_HARDWARE_TESTS=ON`, no hardware | 168/168 passed |
+| C++ hardware tests, `^requires_hardware(_a2a3)?$` | 2/2 passed |
+| Python unit tests, `tests/ut -m "not requires_hardware"` | 2428 passed |
+| Python hardware unit tests, `tests/ut -m requires_hardware --platform a2a3` | 31/31 passed |
+| a2a3 hardware, `tests/ut/py/test_kernel_mode_c_api.py` | 13/13 passed |
+| a2a3 hardware, `tests/st/a2a3/kernel_capture` | passed, 100 replays |
+| a2a3sim scenes | 82 passed, 8 skipped |
+| a5sim scenes | 78 passed |
+| pre-commit hooks on changed files | passed |
+
+The C++ hardware run needs two devices and a CTest resource spec, as
+`.github/workflows/_ut-npu-a2a3.yml` builds one; `test_comm_lifecycle` reports
+"need 2 NPU devices; run with --resource-spec-file" and fails without it.
+
+The Python hardware run collects 31 cases but its resource phase schedules 21.
+The ten it leaves out — the runtime ABI symbol export, runtime builder,
+device-memory-info and two-rank comm/alloc cases — were run directly against
+the same device pool and all pass. None of them is on a path this refresh
+touches.
+
+`persistent_free_close`, the new lifecycle scenario, asserts that the retry
+after a failed release re-attempts and completes rather than that it makes
+exactly one more call. A kernel context on this line releases several device
+blocks and the injected failure stops the first pass partway, so the retry
+covers the failed block plus everything the first pass never reached — eight
+`rtFree` calls across the two passes where the first made three. The
+count-exact form the source PR uses holds only for its own smaller allocation
+set.
+
+`mkdocs build --strict` was not re-run: mkdocs is not installed in this
+worktree and PyPI is unreachable from this host. The refresh adds no page and
+changes no nav entry.
 
 ## Remaining boundaries
 
