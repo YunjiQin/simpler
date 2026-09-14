@@ -169,13 +169,11 @@ protected:
             constexpr size_t padding_begin = offsetof(ChipCallable, config_name_len_) + sizeof(uint32_t);
             std::memset(image.data() + padding_begin, 0xff, offsetof(ChipCallable, storage_) - padding_begin);
         }
-        KernelCallableDeviceResidency residency{17, reinterpret_cast<uint64_t>(image.data()), image.size(), id, 0};
+        KernelCallableDeviceResidency residency{reinterpret_cast<uint64_t>(image.data()), image.size(), id, 0};
         TmrEncodingCache cache;
         TmrEncodingCandidate encoded;
         auto invocation_args = arguments(value);
-        EXPECT_EQ(
-            encode_tmr_invocation(invocation_args, {id, 1, 1, 17}, identity, cache, &encoded), InvocationStatus::Ok
-        );
+        EXPECT_EQ(encode_tmr_invocation(invocation_args, {id, 1, 1}, identity, cache, &encoded), InvocationStatus::Ok);
         const auto invocation = encoded.packet();
         const size_t bytes =
             sizeof(SimplerKernelDispatchArgs) + invocation.size - sizeof(SimplerKernelInvocationHeader);
@@ -213,7 +211,7 @@ protected:
         EXPECT_EQ(init_kernel_execution(), -1);
         EXPECT_EQ(run_kernel_execution(), -1);
         output.fill(0);
-        PreparedInvocationView callable{3, 1, 1, 17};
+        PreparedInvocationView callable{3, 1, 1};
         TmrEncodingCandidate packet;
         TmrEncodingCache cache;
         auto args = arguments(71);
@@ -279,7 +277,7 @@ TEST_F(TmrExecutorExecutionInputsTest, ActualKernelPhasesKeepConfigAndOrchestrat
         for (int id : {3, 4, 3}) {
             SCOPED_TRACE(id);
             output.fill(0);
-            PreparedInvocationView callable{id, 1, 1, 17};
+            PreparedInvocationView callable{id, 1, 1};
             TmrEncodingCandidate packet;
             TmrEncodingCache cache;
             auto args = arguments(++invocation);
@@ -342,7 +340,7 @@ TEST_F(TmrExecutorExecutionInputsTest, FailedInitializationCanReleaseAndReuseExe
         SCOPED_TRACE(serial);
         resident->dev.serial_orch_sched = serial;
         resident->dev.aicpu_thread_num = -1;
-        PreparedInvocationView callable{3, 1, 1, 17};
+        PreparedInvocationView callable{3, 1, 1};
         TmrEncodingCandidate packet;
         TmrEncodingCache cache;
         auto args = arguments(9);
@@ -365,7 +363,7 @@ TEST_F(TmrExecutorExecutionInputsTest, FailedConfigurationCanReleaseAndReuseExec
         SCOPED_TRACE(serial);
         resident->dev.serial_orch_sched = serial;
         output.fill(0);
-        PreparedInvocationView callable{5, 1, 1, 17};
+        PreparedInvocationView callable{5, 1, 1};
         TmrEncodingCandidate packet;
         TmrEncodingCache cache;
         auto args = arguments(9);
@@ -401,7 +399,7 @@ TEST_F(TmrExecutorExecutionInputsTest, FailedConfigurationCanReleaseAndReuseExec
 }
 
 TEST_F(TmrExecutorExecutionInputsTest, RejectedAdmissionLeavesActualExecutorInactive) {
-    PreparedInvocationView callable{3, 1, 1, 17};
+    PreparedInvocationView callable{3, 1, 1};
     TmrEncodingCandidate packet;
     TmrEncodingCache cache;
     auto args = arguments(9);
@@ -415,7 +413,7 @@ TEST_F(TmrExecutorExecutionInputsTest, RejectedAdmissionLeavesActualExecutorInac
     EXPECT_EQ(run_kernel_execution(), -1);
     EXPECT_EQ(kernel_execution_status(), -1);
     auto stale = callable;
-    ++stale.slot_generation;
+    ++stale.callable_id;
     EXPECT_EQ(admit_kernel_execution(packet.packet(), {stale, {}}, binding), InvocationStatus::StaleCallable);
     EXPECT_EQ(init_kernel_execution(), -1);
     EXPECT_EQ(run_kernel_execution(), -1);
@@ -499,7 +497,7 @@ TEST_F(TmrExecutorExecutionInputsTest, DispatchResolvesOnlyTheAdmittedCallablesC
     auto *callable = reinterpret_cast<ChipCallable *>(image.data());
     auto *resident_child = reinterpret_cast<CoreCallable *>(callable->storage_ + callable->child_offsets_[0]);
     resident_child->set_resolved_addr(reinterpret_cast<uint64_t>(resident_child->binary_data()));
-    KernelCallableDeviceResidency residency{17, reinterpret_cast<uint64_t>(image.data()), image.size(), 3, 0};
+    KernelCallableDeviceResidency residency{reinterpret_cast<uint64_t>(image.data()), image.size(), 3, 0};
 
     resident->dev.gm_sm_ptr_ = binding.sm.base;
     resident->dev.prebuilt_arena_base_ = binding.arena.base;
@@ -509,7 +507,7 @@ TEST_F(TmrExecutorExecutionInputsTest, DispatchResolvesOnlyTheAdmittedCallablesC
     TmrEncodingCandidate encoded;
     auto invocation_args = arguments(31);
     ASSERT_EQ(
-        encode_tmr_invocation(invocation_args, {3, 1, 1, 17}, binding.identity, cache, &encoded), InvocationStatus::Ok
+        encode_tmr_invocation(invocation_args, {3, 1, 1}, binding.identity, cache, &encoded), InvocationStatus::Ok
     );
     const auto invocation = encoded.packet();
     const size_t bytes = offsetof(SimplerKernelDispatchArgs, invocation) + invocation.size;

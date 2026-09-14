@@ -23,7 +23,6 @@ KernelCallableDeviceResidency published;
 bool publish_on_invalidate;
 int consumer_result;
 const void *seen_payload;
-uint64_t seen_generation;
 uint64_t seen_binding;
 uint64_t seen_context_generation;
 uint64_t seen_sm_bytes;
@@ -34,20 +33,18 @@ struct Packet {
 };
 class KernelDispatch : public testing::Test {
 protected:
-    KernelCallableDeviceResidency resident{17, 0x100000, 128, 3, 0};
+    KernelCallableDeviceResidency resident{0x100000, 128, 3, 0};
     Packet packet{};
     void SetUp() override {
         consumed = invalidations = 0;
         invalidated_address = seen_payload = nullptr;
         publish_on_invalidate = false;
         consumer_result = 0;
-        seen_generation = 0;
         seen_binding = seen_context_generation = seen_sm_bytes = seen_arena_bytes = 0;
         packet.args.packet_bytes = sizeof(packet);
         packet.args.residency_address = reinterpret_cast<uint64_t>(&resident);
         packet.args.invocation.mode = SIMPLER_MODE_KERNEL;
         packet.args.invocation.callable_id = 3;
-        packet.args.invocation.generation = 17;
         packet.args.invocation.payload_bytes = sizeof(packet.payload);
         packet.payload = 42;
     }
@@ -74,9 +71,8 @@ int consume_kernel_invocation(
     EXPECT_GE(invalidations, consumed);
     EXPECT_EQ(bytes, sizeof(uint64_t));
     EXPECT_EQ(*static_cast<const uint64_t *>(payload), 42);
-    EXPECT_EQ(invocation.generation, resident.generation);
+    EXPECT_EQ(invocation.callable_id, resident.callable_id);
     seen_payload = payload;
-    seen_generation = invocation.generation;
     seen_binding = args.binding_address;
     seen_context_generation = args.context_generation;
     seen_sm_bytes = args.sm_bytes;
@@ -89,7 +85,6 @@ TEST_F(KernelDispatch, ValidPacketReachesConsumerAndPropagatesItsResult) {
     EXPECT_EQ(run(), -83);
     EXPECT_EQ(consumed, 1);
     EXPECT_EQ(seen_payload, &packet.payload);
-    EXPECT_EQ(seen_generation, 17);
     EXPECT_EQ(invalidated_address, &resident);
 }
 
@@ -104,23 +99,16 @@ TEST_F(KernelDispatch, ForwardsContextBindingAndRegionExtentsToRuntimeConsumer) 
     EXPECT_EQ(seen_sm_bytes, 4096u);
     EXPECT_EQ(seen_arena_bytes, 8192u);
 }
-TEST_F(KernelDispatch, RejectsStaleBeforePayloadOrCodeAccess) {
-    packet.args.invocation.generation = 16;
-    resident.device_address = 1;
-    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::Stale));
-    EXPECT_EQ(consumed, 0);
-    EXPECT_EQ(invalidations, 1);
-}
 TEST_F(KernelDispatch, ReplayReadsUpdatedSlotBeforeComparison) {
     EXPECT_EQ(run(), 0);
     published = resident;
-    published.generation = 18;
+    published.callable_id = 4;
     publish_on_invalidate = true;
-    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::Stale));
-    EXPECT_EQ(packet.args.invocation.generation, 17);
+    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::NotResident));
+    EXPECT_EQ(packet.args.invocation.callable_id, 3);
     EXPECT_EQ(invalidations, 2);
     EXPECT_EQ(consumed, 1);
-    packet.args.invocation.generation = 18;
+    packet.args.invocation.callable_id = 4;
     EXPECT_EQ(run(), 0);
     EXPECT_EQ(consumed, 2);
 }
@@ -128,10 +116,10 @@ TEST_F(KernelDispatch, WrongSlotAndEmptySlotNeverConsume) {
     resident.callable_id = 4;
     EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::NotResident));
     resident.callable_id = 3;
-    resident.generation = 0;
-    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::NotResident));
-    resident.generation = 17;
     resident.device_address = 0;
+    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::NotResident));
+    resident.device_address = 0x100000;
+    resident.bytes = 0;
     EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::NotResident));
     EXPECT_EQ(consumed, 0);
 }
@@ -142,9 +130,6 @@ TEST_F(KernelDispatch, InvalidIdentityNeverReadsDescriptor) {
         EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::InvalidArgs));
     }
     packet.args.invocation.callable_id = 3;
-    packet.args.invocation.generation = 0;
-    EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::InvalidArgs));
-    packet.args.invocation.generation = 17;
     packet.args.invocation.mode = SIMPLER_MODE_PROGRAM;
     EXPECT_EQ(run(), static_cast<int>(KernelDispatchStatus::InvalidArgs));
     EXPECT_EQ(invalidations, 0);
@@ -196,7 +181,7 @@ TEST_F(KernelDispatch, CountsAreRejectedBeforeReadingResidency) {
 TEST_F(KernelDispatch, RepeatedValidInvocationDoesNotChangeSnapshot) {
     EXPECT_EQ(run(), 0);
     EXPECT_EQ(run(), 0);
-    EXPECT_EQ(packet.args.invocation.generation, 17);
+    EXPECT_EQ(packet.args.invocation.callable_id, 3);
     EXPECT_EQ(consumed, 2);
     EXPECT_EQ(invalidations, 2);
 }

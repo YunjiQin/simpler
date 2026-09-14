@@ -16,7 +16,6 @@
 // Immutable device-resident descriptor, published before registration. The
 // invocation consumer validates this comparand on every execution/replay.
 struct KernelCallableDeviceResidency {
-    uint64_t generation;
     uint64_t device_address;
     uint64_t bytes;
     int32_t callable_id;
@@ -28,8 +27,7 @@ inline bool kernel_callable_residency_matches(
 ) {
     return invocation.mode == SIMPLER_MODE_KERNEL && invocation.callable_id >= 0 &&
            invocation.callable_id < MAX_REGISTERED_CALLABLE_IDS && invocation.callable_id == resident.callable_id &&
-           invocation.generation != 0 && invocation.generation == resident.generation && resident.device_address != 0 &&
-           resident.bytes != 0 && resident.reserved == 0;
+           resident.device_address != 0 && resident.bytes != 0 && resident.reserved == 0;
 }
 
 static_assert(

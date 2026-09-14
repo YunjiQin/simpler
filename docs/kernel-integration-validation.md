@@ -17,13 +17,13 @@ were adopted and which were deferred.
 | #2173 | HBG context resource preparation and freeze | `15741ac05b24908c71703c72f2549f5fe0e9fa53` | unchanged |
 | #2174 | H2 immutable graph packets | `1fe6bf53f0af9b6a02eeb2edff080a8bc7e7467a` | unchanged |
 | #2175 | H3 execution slot sealing and validation | `89b00a9cad3bdc32dee3ec2ab1a65d21a8a23c20` | unchanged |
-| #2176 | K2 persistent execution resources and capture test | `533f67a13f4c11a02face67a4fc8609926b71ef8` | `abbe07f53cfa` — partially adopted |
+| #2176 | K2 persistent execution resources and capture test | `533f67a13f4c11a02face67a4fc8609926b71ef8` | `abbe07f53cfa` — adopted, including its event topology |
 | #2177 | TMR resource contract and initialization admission | `2153406a0420e8de17cf7397d30864939b1bca0c` | `b569474b2833` — adopted |
 | #2180 | K4 per-invocation snapshots | `b0943525dd8eaeb486bca92bbf5480a37eb61fcb` | unchanged |
-| #2185 | C++, nanobind and Python kernel entry points | `32dd9442f79bb936541cf41a6a08d7838d450134` | `7058de9f9f4d` — partially adopted |
-| #2187 | Three-stream launch binder and compensation | `136e9712d22c495ac921a6900c8f24fa9b8ebcf3` | unchanged |
+| #2185 | C++, nanobind and Python kernel entry points | `32dd9442f79bb936541cf41a6a08d7838d450134` | `7058de9f9f4d` — adopted |
+| #2187 | Three-stream launch binder and compensation | `136e9712d22c495ac921a6900c8f24fa9b8ebcf3` | unchanged; its binder rewritten to the chained topology |
 | #2189 | K5 resident and per-invocation execution state | `b6435e4858b1e0443966d664cca478276baefa55` | unchanged |
-| #2190 | Callable cache, residency and generation validation | `2c876478dbf41fad5c0019f081261d912e9b687e` | `5f9895d7c0e4` — generation model dropped, deferred |
+| #2190 | Callable cache, residency and generation validation | `2c876478dbf41fad5c0019f081261d912e9b687e` | `5f9895d7c0e4` — id shape adopted; block allocator not taken |
 | #2193 | K3 capacity refusal without releasing existing resources | `b8e739d9d8143ca6f35bf2177241976f900e2ab7` | unchanged |
 
 The two audited HBG heads were force-pushed away and are no longer fetchable;
@@ -216,11 +216,57 @@ set.
 worktree and PyPI is unreachable from this host. The refresh adds no page and
 changes no nav entry.
 
+## Target call-flow rebase revalidation (2026-09-14)
+
+The line was rebased onto the target call-flow design — registration mints the
+id, no callable generation anywhere, and the chained caller/AICPU/AICore launch
+topology. The decisions are D16 in the integration log. Hardware work passed the
+architecture precheck and acquired devices through `task-submit`.
+
+| Suite | Result |
+| ----- | ------ |
+| Native builds: a2a3, a5, a2a3sim, a5sim, nanobind extension | all succeeded |
+| C++ unit tests, no hardware | 166/166 passed |
+| C++ unit tests with `SIMPLER_ENABLE_HARDWARE_TESTS=ON`, no hardware | 168/168 passed |
+| C++ hardware tests, `^requires_hardware(_a2a3)?$` | 2/2 passed |
+| Python unit tests, `tests/ut -m "not requires_hardware"` | 2428 passed |
+| Python hardware unit tests, `tests/ut -m requires_hardware --platform a2a3` | 31/31 passed |
+| a2a3 hardware, `tests/ut/py/test_kernel_mode_c_api.py` | 13/13 passed |
+| a2a3 hardware, `tests/st/a2a3/kernel_capture` | passed, 100 replays |
+| a2a3 onboard scenes, `-m "not sdma" --exclude-level 4` | 167 passed, 1 skipped |
+| a2a3 SDMA scenes | 3 passed |
+| a2a3sim scenes | 82 passed, 8 skipped |
+| a5sim scenes | 78 passed |
+| pre-commit hooks on changed files | passed |
+
+The capture probe now drives the chained sequence — caller records `Start`,
+AICPU waits it and records `AicoreStart`, AICore waits that and records
+`AicoreDone`, AICPU joins it and records `AicpuDone`, the caller joins that — and
+still completes 100 captured replays with verified buffers on a2a3. That is the
+hardware evidence for the topology; the public `prepare -> launch` entries are
+still not exercised inside a captured graph by any test, so two-hop capture
+propagation through the real entries remains unproven.
+
+Two expectations moved with the contract rather than with a defect. A second
+registration of the same image now mints a second id and uploads a second copy,
+but `committed_device_memory_ctx` does not grow: the code arena and its
+descriptor prefix are committed once on first use, so a later registration
+spends arena budget instead of new device memory. And `persistent_free_close`
+asserts that the retry after a failed release re-attempts and completes rather
+than that it makes exactly one more `rtFree` call.
+
+`mkdocs build --strict` was not re-run: mkdocs is not installed in this worktree
+and PyPI is unreachable from this host. The change adds no page and changes no
+nav entry.
+
 ## Remaining boundaries
 
 - H4 has no submitted PR in the supplied pipeline. HBG kernel capability is
   zero; init returns `UNSUPPORTED`, and prepare/launch without a kernel claim
   return `INVALID_STATE`. H1-H3 module tests do not establish public HBG execution.
+- H1 (#2171) and 2B (#2172) were force-pushed onto a different decomposition
+  after the 2026-09-11 audit. This line still carries the audited shape, so the
+  HBG contribution is the one thing the target rebase did not cover.
 - A5 is compiled and exercised through unit/simulation tests. No A5 hardware
   is available in this validation environment.
 - Capture primitives and the public eager TMR path are separately tested.

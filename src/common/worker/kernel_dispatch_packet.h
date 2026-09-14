@@ -50,7 +50,6 @@ public:
         prefix.arena_bytes = arena_bytes;
         prefix.invocation.mode = SIMPLER_MODE_KERNEL;
         prefix.invocation.callable_id = callable_.callable_id;
-        prefix.invocation.generation = callable_.slot_generation;
         prefix.invocation.payload_bytes = bytes_.size() - sizeof(prefix);
         prefix.invocation.tensor_count = callable_.tensor_count;
         prefix.invocation.scalar_count = callable_.scalar_count;

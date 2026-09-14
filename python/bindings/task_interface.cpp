@@ -3558,18 +3558,15 @@ NB_MODULE(_task_interface, m) {
         )
         .def(
             "kernel_prepare_callable",
-            [](ChipWorker &self, int32_t callable_id, const PyChipCallable &callable, uint64_t caller_stream) {
-                self.kernel_prepare_callable(
-                    callable_id, callable.buffer_.data(), callable.buffer_.size(),
-                    reinterpret_cast<void *>(caller_stream)
-                );
+            [](ChipWorker &self, const PyChipCallable &callable) {
+                return self.kernel_prepare_callable(callable.buffer_.data(), callable.buffer_.size());
             },
-            nb::arg("callable_id"), nb::arg("callable"), nb::arg("caller_stream"),
-            nb::call_guard<nb::gil_scoped_release>(),
-            "Stage a callable for kernel-mode launches on the caller's stream. "
-            "caller_stream is an aclrtStream as an integer address — the same "
-            "thing torch_npu.npu.current_stream().npu_stream yields. The stream is "
-            "borrowed for this call only and is never stored or destroyed here."
+            nb::arg("callable"), nb::call_guard<nb::gil_scoped_release>(),
+            "Register a callable for kernel-mode launches and return the "
+            "context-local id it was minted under. Takes no stream: registration "
+            "enqueues on the context's own AICPU stream, which every later launch "
+            "also enqueues on. Registration is not deduplicated — the same "
+            "callable registered twice takes two ids and two uploads."
         )
         .def(
             "kernel_launch",

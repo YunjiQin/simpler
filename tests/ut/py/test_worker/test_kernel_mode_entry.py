@@ -71,7 +71,7 @@ def _run_case(case: str, device_id: int, platform: str, queue) -> None:
             # something else.
             unsupported_bins = builder.get_binaries("host_build_graph", build=False)
             with pytest.raises(Exception) as excinfo:  # noqa: PT011
-                worker.kernel_init(device_id, unsupported_bins, config, stream)
+                worker.kernel_init(device_id, unsupported_bins, config)
             result["error"] = str(excinfo.value)
             result["reached_abi"] = "kernel mode" in str(excinfo.value)
             result["initialized_after"] = bool(worker._impl.initialized)
@@ -81,13 +81,13 @@ def _run_case(case: str, device_id: int, platform: str, queue) -> None:
         elif case == "init_claims_borrowed_stream":
             # One kernel context per device and runtime: the first claim holds,
             # and a second worker is refused without disturbing the owner.
-            worker.kernel_init(device_id, bins, config, stream)
+            worker.kernel_init(device_id, bins, config)
             result["stage"] = "kernel_init"
             result["initialized"] = bool(worker._impl.initialized)
             result["kernel_supported"] = bool(worker.kernel_mode_supported)
             refused = ChipWorker()
             try:
-                refused.kernel_init(device_id, bins, config, stream)
+                refused.kernel_init(device_id, bins, config)
                 result["second_claim_refused"] = False
             except RuntimeError as exc:
                 result["second_claim_refused"] = True
@@ -105,9 +105,11 @@ def _run_case(case: str, device_id: int, platform: str, queue) -> None:
             )
 
         elif case == "null_stream_rejected":
-            # Named at the Python boundary rather than deep in the C ABI.
+            # The execution stream belongs to launch, not to init, so this is
+            # where a null one has to be named. Rejecting at the Python boundary
+            # names the argument instead of surfacing a bare ABI code.
             with pytest.raises(ValueError) as excinfo:
-                worker.kernel_init(device_id, bins, config, 0)
+                worker.kernel_launch(0, None, 0)
             result["error"] = str(excinfo.value)
             result["ok"] = "caller_stream" in str(excinfo.value)
 
@@ -139,7 +141,7 @@ def _run_case(case: str, device_id: int, platform: str, queue) -> None:
             result["initialized"] = bool(worker._impl.initialized)
             result["kernel_supported"] = bool(worker.kernel_mode_supported)
             try:
-                worker.kernel_init(device_id, bins, config, stream)
+                worker.kernel_init(device_id, bins, config)
                 result["second_init_refused"] = False
             except RuntimeError:
                 result["second_init_refused"] = True

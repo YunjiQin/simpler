@@ -114,7 +114,7 @@ inline InvocationStatus admit_kernel_dispatch(
         runtime->get_prebuilt_runtime_offset()
     };
     const KernelCallableView prepared{
-        {residency.callable_id, tensors, scalars, residency.generation}, {group.functions, RUNTIME_MAX_FUNC_ID}
+        {residency.callable_id, tensors, scalars}, {group.functions, RUNTIME_MAX_FUNC_ID}
     };
     static_assert(offsetof(SimplerKernelDispatchArgs, invocation) + sizeof(args.invocation) == sizeof(args));
     return admit_kernel_execution(

@@ -28,7 +28,7 @@ using simpler::tmr::TmrBindingRef;
 using simpler::tmr::TmrExecutionBindingView;
 using simpler::tmr::TmrInvocationView;
 
-constexpr PreparedInvocationView kCallable{7, 1, 1, 19};
+constexpr PreparedInvocationView kCallable{7, 1, 1};
 constexpr TmrExecutionBindingView kBinding{0x80000, 31};
 constexpr uint64_t kResidency = 0x90000;
 constexpr size_t kSmBytes = 0x100000;
@@ -68,8 +68,8 @@ void expect_values(ByteSpan packet, uint64_t address, uint64_t scalar) {
 
 TEST(KernelDispatchPacket, PrepareReservesExactWireSizeIncludingEmptyAndMaximumSignatures) {
     for (const auto &callable :
-         {PreparedInvocationView{0, 0, 0, 1}, PreparedInvocationView{2, 3, 2, 9},
-          PreparedInvocationView{7, CHIP_MAX_TENSOR_ARGS - CHIP_MAX_SCALAR_ARGS, CHIP_MAX_SCALAR_ARGS, 19}}) {
+         {PreparedInvocationView{0, 0, 0}, PreparedInvocationView{2, 3, 2},
+          PreparedInvocationView{7, CHIP_MAX_TENSOR_ARGS - CHIP_MAX_SCALAR_ARGS, CHIP_MAX_SCALAR_ARGS}}) {
         KernelDispatchPacket packet;
         ASSERT_EQ(packet.prepare(callable), InvocationStatus::Ok);
         EXPECT_EQ(
@@ -79,7 +79,7 @@ TEST(KernelDispatchPacket, PrepareReservesExactWireSizeIncludingEmptyAndMaximumS
         );
     }
     KernelDispatchPacket empty;
-    const PreparedInvocationView callable{0, 0, 0, 1};
+    const PreparedInvocationView callable{0, 0, 0};
     ASSERT_EQ(empty.prepare(callable), InvocationStatus::Ok);
     ASSERT_EQ(empty.encode({}, kResidency, kBinding, kSmBytes, kArenaBytes), InvocationStatus::Ok);
     TmrInvocationView decoded;
@@ -101,14 +101,13 @@ TEST(KernelDispatchPacket, EncodedDispatchEnvelopeMatchesTheRuntimeDecoder) {
     EXPECT_EQ(envelope.sm_bytes, kSmBytes);
     EXPECT_EQ(envelope.arena_bytes, kArenaBytes);
     EXPECT_EQ(envelope.invocation.callable_id, kCallable.callable_id);
-    EXPECT_EQ(envelope.invocation.generation, kCallable.slot_generation);
     EXPECT_EQ(envelope.invocation.payload_bytes, packet.packet().size - sizeof(envelope));
     EXPECT_EQ(envelope.invocation.host_copy_tensor_count, 0);
     expect_values(packet.packet(), 0x10000, 41);
 
     TmrInvocationView decoded;
     auto stale = kCallable;
-    ++stale.slot_generation;
+    ++stale.callable_id;
     EXPECT_EQ(
         decode_tmr_invocation(invocation(packet.packet()), stale, kBinding, &decoded), InvocationStatus::StaleCallable
     );
@@ -147,9 +146,8 @@ TEST(KernelDispatchPacket, RejectsBadPreparationWithoutLosingThePreparedPacket) 
     ASSERT_EQ(packet.prepare(kCallable), InvocationStatus::Ok);
     const auto storage = packet.packet();
     for (const auto &bad :
-         {PreparedInvocationView{-1, 1, 1, 1}, PreparedInvocationView{0, -1, 1, 1}, PreparedInvocationView{0, 1, -1, 1},
-          PreparedInvocationView{0, 1, 1, 0}, PreparedInvocationView{0, CHIP_MAX_TENSOR_ARGS, 1, 1},
-          PreparedInvocationView{0, 0, CHIP_MAX_SCALAR_ARGS + 1, 1}}) {
+         {PreparedInvocationView{-1, 1, 1}, PreparedInvocationView{0, -1, 1}, PreparedInvocationView{0, 1, -1},
+          PreparedInvocationView{0, CHIP_MAX_TENSOR_ARGS, 1}, PreparedInvocationView{0, 0, CHIP_MAX_SCALAR_ARGS + 1}}) {
         EXPECT_EQ(packet.prepare(bad), InvocationStatus::InvalidArgument);
         EXPECT_EQ(packet.packet().data, storage.data);
         EXPECT_EQ(packet.packet().size, storage.size);

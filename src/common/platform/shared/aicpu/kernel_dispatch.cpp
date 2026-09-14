@@ -29,8 +29,8 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_kernel_exec(
     if (args.packet_bytes < sizeof(args) || args.packet_bytes > std::numeric_limits<size_t>::max() ||
         invocation.payload_bytes != args.packet_bytes - sizeof(args) || invocation.mode != SIMPLER_MODE_KERNEL ||
         invocation.callable_id < 0 || invocation.callable_id >= MAX_REGISTERED_CALLABLE_IDS ||
-        invocation.generation == 0 || invocation.tensor_count < 0 || invocation.tensor_count > CHIP_MAX_TENSOR_ARGS ||
-        invocation.scalar_count < 0 || invocation.scalar_count > CHIP_MAX_SCALAR_ARGS ||
+        invocation.tensor_count < 0 || invocation.tensor_count > CHIP_MAX_TENSOR_ARGS || invocation.scalar_count < 0 ||
+        invocation.scalar_count > CHIP_MAX_SCALAR_ARGS ||
         invocation.tensor_count > CHIP_MAX_TENSOR_ARGS - invocation.scalar_count ||
         invocation.host_copy_tensor_count != 0 || invocation.reserved_ != 0)
         return static_cast<int>(KernelDispatchStatus::InvalidArgs);
@@ -45,8 +45,8 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_kernel_exec(
     cache_invalidate_range(descriptor, sizeof(*descriptor));
     KernelCallableDeviceResidency resident;
     std::memcpy(&resident, descriptor, sizeof(resident));
-    if (resident.callable_id != invocation.callable_id || resident.generation == 0 || resident.device_address == 0 ||
-        resident.bytes == 0 || resident.reserved != 0)
+    if (resident.callable_id != invocation.callable_id || resident.device_address == 0 || resident.bytes == 0 ||
+        resident.reserved != 0)
         return static_cast<int>(KernelDispatchStatus::NotResident);
     if (!kernel_callable_residency_matches(invocation, resident)) return static_cast<int>(KernelDispatchStatus::Stale);
 

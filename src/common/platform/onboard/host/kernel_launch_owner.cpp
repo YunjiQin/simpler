@@ -25,7 +25,7 @@ int DeviceRunnerBase::launch_kernel_callable(
     int rc = adopt_borrowed_device(device_id_);
     if (rc != 0) return rc;
     KernelCallableResidency residency;
-    rc = kernel_callable_cache_.resolve({callable_id, kernel_callable_cache_.generation()}, residency);
+    rc = kernel_callable_cache_.resolve(callable_id, residency);
     if (rc != 0) return rc;
     auto it = callables_.find(callable_id);
     if (it == callables_.end() || !kernel_aicpu_handle_ || !aicore_bin_handle_)
@@ -75,12 +75,11 @@ int DeviceRunnerBase::launch_kernel_callable(
         auto &h = out->handles;
         h.aicpu = r.kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu);
         h.aicore = r.kernel_exec_state_.hidden_stream(KernelStreamKind::Aicore);
-        h.prepare_tail = r.kernel_exec_state_.event(KernelEventKind::PrepareTail);
         h.start = r.kernel_exec_state_.event(KernelEventKind::Start);
+        h.aicore_start = r.kernel_exec_state_.event(KernelEventKind::AicoreStart);
         h.aicore_done = r.kernel_exec_state_.event(KernelEventKind::AicoreDone);
         h.aicpu_done = r.kernel_exec_state_.event(KernelEventKind::AicpuDone);
         h.serial_tail = r.kernel_exec_state_.event(KernelEventKind::SerialTail);
-        h.consume_prepare_tail = r.kernel_prepare_pending_;
         out->previous_caller_identity = r.kernel_previous_caller_;
         return 0;
     };
@@ -88,7 +87,6 @@ int DeviceRunnerBase::launch_kernel_callable(
         auto &s = *static_cast<Submission *>(context);
         if (result.status == 0) {
             s.runner->kernel_previous_caller_ = reinterpret_cast<uintptr_t>(s.caller);
-            s.runner->kernel_prepare_pending_ = false;
         } else if (result.enqueue_started) {
             s.runner->kernel_exec_state_.poison(result.status);
         }

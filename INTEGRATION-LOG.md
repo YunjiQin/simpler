@@ -574,39 +574,99 @@ translation unit; removing it from the simulation lists leaves
 `libhost_runtime.so` with an undefined symbol that `test_pipeline_contract_loader`
 catches at `dlopen`.
 
-**Deferred, and what each needs.**
+**Deferred here, and decided in D16.** The four rows marked "yes" are not open
+questions: `.docs/vllm/kernel-mode-design.md`'s companion call-flow document
+settles all but the last of them, and D16 adopts that settlement. They are
+listed here as what this pass did not take, not as what still needs arguing.
 
-- **D3, `prepare_callable`'s stream parameter.** D3's first reason was that
-  the entry layer, #2185, called the five-parameter form and K2 was the
-  outlier. #2185 has since moved to four, so the count is now #2176, #2180,
-  #2185 and #2189 for four against #2177 and #2193 for five. D3's remaining
-  reasons — the K1 freeze card, expressiveness, symmetry with launch — are
-  untouched by the move, so the decision may still stand; but its stated
-  evidence no longer supports it and it has to be re-argued rather than
-  assumed.
-- **D7 and D8, the callable generation.** D7 kept `int32_t callable_id` on
-  both entries specifically because the generation guard was "the valuable
-  half of #2190" and survived the collapse. That half no longer exists in
-  #2190: there is no `generation` on a residency, `resolve` indexes
-  `entries_` directly, and `CALLABLE_STALE` has no producer. Adopting the new
-  cache means deciding whether this line keeps a guard its source has
-  dropped.
-- **D9 and the capture boundary.** #2176's header now records that a wait
-  issued during capture on an event recorded before capture is rejected by
-  CANN as 107024, and concludes that preparation must not publish a tail for a
-  later captured launch to consume. This line does exactly that:
-  `prepare_callable` records `PrepareTail` on the control stream, and
-  `kernel_prepare_pending_` makes the next launch wait on it
-  (`kernel_launch_sequence.h`, `KernelLaunchStep::PrepareWait`). If the note
-  is right, a first launch that is captured fails, and the five-event topology
-  D9 chose needs a fourth event or a different ordering. Adopting the note
-  without changing the topology would only document a contradiction, so both
-  move together or neither does.
+- **D3, `prepare_callable`'s stream parameter.** D3's first reason was that the
+  entry layer, #2185, called the five-parameter form and K2 was the outlier.
+  \#2185 has since moved to four, so that evidence no longer holds.
+- **D7 and D8, the callable generation.** D7 kept `int32_t callable_id` on both
+  entries because the generation guard was "the valuable half of #2190" and
+  survived the collapse. That half no longer exists in #2190.
+- **D9 and the capture boundary.** #2176's header records that a wait issued
+  during capture on an event recorded before capture is rejected by CANN as
+  107024, and concludes that preparation must not publish a tail for a later
+  captured launch to consume. This line does exactly that, so the note and the
+  five-event sibling topology cannot both stand.
 - **D2 and D11, the H chain.** #2171 and #2172 were force-pushed onto a
   different decomposition: a `GraphDefinitionPack` with its own translation
   unit, and `kernel_resource_plan.h` where this line has
-  `kernel_resource_requirements.h`. Re-integrating them is a rewrite of the
-  H contribution, not a patch to it.
+  `kernel_resource_requirements.h`. Re-integrating them is a rewrite of the H
+  contribution, not a patch to it, and no target document covers it.
 
 **Affects.** #2176, #2177, #2185 (partially adopted); #2171, #2172, #2190
-(deferred in full); D2, D3, D7, D8, D9, D11 (flagged for re-adjudication).
+(deferred here); D2, D3, D7, D8, D9, D11 (superseded or restated in D16).
+
+---
+
+## D16 - Adopt the target call-flow design: minted ids, no generation, chained streams
+
+**Problem.** D15 left four adjudications open. Three of them are settled by the
+target design the kernel-mode work is being built against — the vLLM call-flow
+document dated 2026-09-13, with the callable-id shape frozen 2026-09-14 — which
+names this integration line explicitly and says it "still has the old shape" and
+needs rebasing onto #2185's signature and #2190's callable-id out parameter.
+That design is not one more PR's opinion: it is what the three-party contract
+between vLLM, PyPTO and simpler is written to.
+
+**Finding.** The three are one package, not three independent choices.
+
+The four-parameter prepare (D3) and the deleted `PrepareTail` (D9) stand or fall
+together with the stream topology. `PrepareTail` exists on this line only because
+D9 chose #2187's sibling topology, in which both device branches fork from the
+caller's `Start`: AICore's stream is then unrelated to the AICPU stream, so
+nothing orders it behind registration and an event has to. In the target's
+chained topology AICore forks from AICPU, so the AICPU stream's own FIFO carries
+registration ahead of every launch and no event is needed. Taking the
+four-parameter prepare without the chained topology would be the worst of both:
+prepare would lose the stream it currently orders, leaving the launch-side
+`PrepareTail` wait as the only mechanism — and that wait is precisely what
+crosses the ACLGraph capture boundary.
+
+**Choice.** Adopt the target design.
+
+1. **Registration mints the id.** `simpler_kernel_mode_prepare_callable(ctx,
+   callable, size, int32_t *out)` writes a context-local id on success and -1 on
+   every failure. It takes no `caller_stream`; only launch does, per call.
+2. **Registration is pure.** No deduplication and no lookup: the same image
+   registered twice takes two ids, two uploads and two charges. Capacity is
+   spent per registration.
+3. **No callable generation, anywhere.** `SimplerCallableHandle`,
+   `PTO_RUNTIME_ERR_CALLABLE_STALE`, `KernelCallableDeviceResidency::generation`
+   and `SimplerKernelInvocationHeader::generation` are gone; the wire header is
+   32 bytes. What replaces the guard is three properties together: an id is
+   minted once and never reused within a context, close invalidates every id the
+   context minted, and a closed worker accepts no launch.
+4. **The launch sequence is chained.** Events are `Start`, `AicoreStart`,
+   `AicoreDone`, `AicpuDone`, `SerialTail`. Caller records `Start`; AICPU waits
+   it, clears the handshake, records `AicoreStart`; AICore waits that, launches,
+   records `AicoreDone`; AICPU launches with HostArgs, waits `AicoreDone`,
+   records `AicpuDone`; the caller waits that and records `SerialTail`. Caller
+   and AICore share no event, so capture propagates in two hops.
+5. **`PTO_RUNTIME_ERR_CAPACITY_EXCEEDED` moves to `BASE - 8`,** the slot
+   `CALLABLE_STALE` vacated. Nothing outside this line pins either value: the
+   merged K1 on `main` declares no `CALLABLE_*` code at all.
+
+**Reason.** Items 1 to 3 are the frozen contract of the document PyPTO and vLLM
+are being written against; keeping this line's shape would mean every consumer
+adapts to an integration branch rather than to the design. Item 4 is what makes
+items 1 and 2 safe, and independently removes the 107024 exposure D15 recorded.
+Item 5 keeps the error band dense rather than leaving a hole behind a code no
+producer emits any more.
+
+**Kept against the source PRs.** #2190's block allocator is not taken. Its cache
+is host-only — that branch carries no device dispatch — whereas this line's
+AICPU entry resolves a descriptor at `arena_ + callable_id * sizeof(descriptor)`.
+The single arena with its descriptor prefix stays; only the generation, the
+deduplication and the caller-chosen id leave it. The descriptor shrinks to 24
+bytes accordingly.
+
+**Boundary.** The chained topology is what #2176's capture probe validates on
+a2a3, and `tests/st/a2a3/kernel_capture` now drives that sequence. The public
+`prepare -> launch` path is still not exercised inside a captured graph by any
+test, so two-hop capture propagation through the real entries remains unproven.
+
+**Affects.** #2176, #2180, #2185, #2189, #2190 (their shapes adopted); #2187
+(its binder rewritten to the chained topology); D3, D7, D8, D9 (superseded).

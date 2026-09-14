@@ -13,14 +13,13 @@
 #include "kernel_callable_residency.h"
 
 TEST(KernelDispatchUnavailable, ProductionConsumerDoesNotReportExecutionSuccess) {
-    KernelCallableDeviceResidency resident{17, 0x100000, 128, 3, 0};
+    KernelCallableDeviceResidency resident{0x100000, 128, 3, 0};
     SimplerKernelDispatchArgs packet{};
     packet.packet_bytes = sizeof(packet);
     packet.residency_address = reinterpret_cast<uint64_t>(&resident);
     packet.invocation.mode = SIMPLER_MODE_KERNEL;
     packet.invocation.callable_id = 3;
-    packet.invocation.generation = 17;
     EXPECT_EQ(simpler_aicpu_kernel_exec(&packet), static_cast<int>(KernelDispatchStatus::UnsupportedPayload));
-    packet.invocation.generation = 16;
-    EXPECT_EQ(simpler_aicpu_kernel_exec(&packet), static_cast<int>(KernelDispatchStatus::Stale));
+    packet.invocation.callable_id = 4;
+    EXPECT_EQ(simpler_aicpu_kernel_exec(&packet), static_cast<int>(KernelDispatchStatus::NotResident));
 }

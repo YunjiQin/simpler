@@ -74,7 +74,7 @@ simpler 没有调用过它们。
 | 入口 | 做什么 |
 | ---- | ------ |
 | `simpler_kernel_mode_init` | 用 `aclrtGetDevice` 确认当前卡与传入卡号一致，只核对不设置；用 `rtStreamCreate` 创建两条私有 stream（AICPU、AICore）和 5 个 event；加载 AICPU 执行体。容量配置此时固定 |
-| `simpler_kernel_mode_prepare_callable` | 上传 callable 镜像，把编排 .so 注册到设备；首次调用时提交 pooled arena，上传常驻 Runtime 与 KernelArgs |
+| `simpler_kernel_mode_prepare_callable` | 上传 callable 镜像并铸造 callable_id（出参返回），把编排 .so 注册到设备；首次调用时提交 pooled arena，上传常驻 Runtime 与 KernelArgs |
 | `simpler_kernel_mode_launch` | 校验上下文与 callable 驻留，编码本次参数包，在三条 stream 上排布一串异步操作后返回 |
 | `finalize_device` | 释放上下文拥有的资源；测试断言 committed memory 归零 |
 
@@ -114,7 +114,7 @@ AICore 先于 AICPU 提交：AICPU 上的调度器会自旋等待 AICore 的握�
 
 AICPU 入口 `simpler_aicpu_kernel_exec` 收到参数包后：
 
-1. 校验包头，读取 callable 的驻留描述符并比对 generation，不匹配即拒绝。
+1. 校验包头，读取 callable 的驻留描述符并比对 callable_id，不匹配即拒绝。
 2. 进入 TMR 执行路径，从参数包中的 binding 地址读出常驻 KernelArgs 与 Runtime。
 3. 设置平台寄存器，由 leader 线程接纳本次调用，多个 AICPU 线程在 barrier 汇合。
 4. 运行编排函数，编排提交的 AIV 任务经握手区派发给 AICore。
@@ -187,8 +187,7 @@ launch 路径能在 eager 下算对。在 capture 窗口内调用 `simpler_kerne
 | `PTO_RUNTIME_ERR_CALLABLE_COUNT_EXCEEDED` | -1005 |
 | `PTO_RUNTIME_ERR_CALLABLE_BYTES_EXCEEDED` | -1006 |
 | `PTO_RUNTIME_ERR_CALLABLE_NOT_RESIDENT` | -1007 |
-| `PTO_RUNTIME_ERR_CALLABLE_STALE` | -1008 |
-| `PTO_RUNTIME_ERR_CAPACITY_EXCEEDED` | -1009 |
+| `PTO_RUNTIME_ERR_CAPACITY_EXCEEDED` | -1008 |
 
 ## 10. 已知边界
 
