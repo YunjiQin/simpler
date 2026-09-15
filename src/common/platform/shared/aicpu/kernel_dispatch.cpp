@@ -24,7 +24,8 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_kernel_exec(
     // owner. A rejected prefix must not dereference it for AICore cancellation.
     const auto &args = *static_cast<const SimplerKernelDispatchArgs *>(arg);
     const auto &invocation = args.invocation;
-    if (args.packet_bytes < sizeof(args) || args.packet_bytes > std::numeric_limits<size_t>::max() ||
+    if (args.packet_bytes < sizeof(args) ||
+        args.packet_bytes > std::numeric_limits<uintptr_t>::max() - reinterpret_cast<uintptr_t>(arg) ||
         invocation.payload_bytes != args.packet_bytes - sizeof(args) || invocation.mode != SIMPLER_MODE_KERNEL ||
         invocation.callable_id < 0 || invocation.callable_id >= MAX_REGISTERED_CALLABLE_IDS ||
         invocation.tensor_count < 0 || invocation.tensor_count > CHIP_MAX_TENSOR_ARGS || invocation.scalar_count < 0 ||
