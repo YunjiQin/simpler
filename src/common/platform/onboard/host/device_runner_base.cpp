@@ -55,6 +55,8 @@
 #include "runtime_c_api.h"
 #include "task_args_wire.h"
 #include "utils/elf_build_id.h"
+
+static_assert(KERNEL_MAX_FUNC_ID == RUNTIME_MAX_FUNC_ID, "Kernel child function ID bounds must match runtime");
 // `runtime.h` (pulled in via `device_runner_helpers.h` in the base header)
 // supplies the per-arch `Handshake` + `Runtime` types used by
 // `print_handshake_results` / `bind_callable_to_runtime` /

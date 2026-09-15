@@ -15,7 +15,6 @@
 #include <stdint.h>
 
 #include <algorithm>
-#include <type_traits>
 
 #include "callable.h"
 #include "callable_protocol.h"
@@ -82,14 +81,13 @@ inline int validate_kernel_callable_image(const void *callable_image, size_t cal
     size_t used = callable->binary_size_;
     if (used > storage_size) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
 
-    constexpr size_t function_capacity = std::extent_v<decltype(ChipCallable::child_func_ids_)>;
     for (int32_t i = 0; i < callable->child_count_; ++i) {
         /* A func_id outside the device function table, or one repeated within
            this image, would have the device consumer overwrite a mapping it
            built earlier in the same invocation. */
         const int32_t func_id = callable->child_func_ids_[i];
         const auto *seen_end = callable->child_func_ids_ + i;
-        if (func_id < 0 || static_cast<size_t>(func_id) >= function_capacity ||
+        if (func_id < 0 || func_id >= KERNEL_MAX_FUNC_ID ||
             std::find(callable->child_func_ids_, seen_end, func_id) != seen_end) {
             return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
         }

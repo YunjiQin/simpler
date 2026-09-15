@@ -61,7 +61,8 @@ prepare / launch / finalize 查询设备失败时原样返回查询错误；设�
 
 每个 `DeviceRunnerBase` 拥有一份
 [KernelCallableCache](../../src/common/platform/include/host/kernel_callable_cache.h)。
-`stage` 校验镜像大小、signature、名称、子项布局和子函数 ID，拒绝存在未完成准备的
+`stage` 校验镜像大小、signature、名称、子项布局和子函数 ID（超出
+`[0, KERNEL_MAX_FUNC_ID)` 或在同一镜像内重复即拒绝），拒绝存在未完成准备的
 条目，再检查数量/字节预算，然后铸造下一个 ID。
 
 | 情况 | 行为 |

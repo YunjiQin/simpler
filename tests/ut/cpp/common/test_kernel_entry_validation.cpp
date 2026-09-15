@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <vector>
 
 #include "host/kernel_entry_validation.h"
 
@@ -147,6 +148,24 @@ TEST(KernelEntryValidation, LaunchChecksPointersAndIdRange) {
         validate_kernel_launch_args(kCtx, MAX_REGISTERED_CALLABLE_IDS, kCallableImage, kStream),
         PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
+}
+
+TEST(KernelEntryValidation, CallableImageRejectsInvalidAndDuplicateChildFunctionIds) {
+    const auto child = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, kBinary, sizeof(kBinary));
+    const int32_t ids[] = {0, KERNEL_MAX_FUNC_ID - 1};
+    const std::vector<uint8_t> children[] = {child, child};
+    auto image =
+        make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(nullptr, 0, "orch", nullptr, 0, ids, children, 2, "");
+    auto *callable = reinterpret_cast<ChipCallable *>(image.data());
+    EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), 0);
+    for (int32_t id : {-1, KERNEL_MAX_FUNC_ID, MAX_REGISTERED_CALLABLE_IDS - 1}) {
+        callable->child_func_ids_[1] = id;
+        EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    }
+    callable->child_func_ids_[1] = 0;
+    EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    callable->child_func_ids_[0] = KERNEL_MAX_FUNC_ID - 1;
+    EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), 0);
 }
 
 }  // namespace
