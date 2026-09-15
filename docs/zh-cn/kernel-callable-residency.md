@@ -34,7 +34,7 @@ int simpler_kernel_mode_launch(
 后续 launch 发在同一条流上，FIFO 已经承接注册顺序。
 
 ID 由 simpler 铸造：成功时通过出参返回 `[0, MAX_REGISTERED_CALLABLE_IDS)` 内的
-context-local `int32_t`，失败写 `-1`。当前上限为 64。
+context-local `int32_t`，失败写 `-1`。当前上限为 8192。
 
 ```cpp
 // 已完成 caller 的 ACL 初始化、选卡以及 simpler_kernel_mode_init。
@@ -71,7 +71,12 @@ prepare / launch / finalize 查询设备失败时原样返回查询错误；设�
 | 存在未 ready 的条目 | 拒绝后续 stage，防止暴露未完成准备的资源 |
 
 代码预算为 512 MiB；每次注册按 `align_up(callable_size, 64)` 计费，包含整个
-`ChipCallable`——预算按注册次数消耗，不按不同镜像数消耗。首次上传分配固定代码区和
+`ChipCallable`——预算按注册次数消耗，不按不同镜像数消耗。
+
+数量上限和字节预算哪个先到，取决于镜像大小。`sizeof(ChipCallable)` 是 9376 字节，
+所以 8192 个空壳镜像只占 73.5 MiB，数量先到；而带真实 orchestration SO 与 AICore
+二进制的镜像若为 1 MiB 量级，512 个就用满预算，字节先到。两个上限都会返回各自的
+错误码（`CALLABLE_COUNT_EXCEEDED` / `CALLABLE_BYTES_EXCEEDED`）。首次上传分配固定代码区和
 代码区，后续不扩容：
 
 ```text

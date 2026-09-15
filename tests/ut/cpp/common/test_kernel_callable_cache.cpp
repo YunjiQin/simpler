@@ -52,24 +52,28 @@ int prepare(KernelCallableCache &cache, FakeDevice &device, int id, const std::v
 }
 size_t charge(const std::vector<uint8_t> &blob) { return (blob.size() + 63) & ~size_t(63); }
 
-TEST(KernelCallableCache, SixtyFourResidentsThenCountErrorWithoutMutation) {
+TEST(KernelCallableCache, EveryIdResidentThenCountErrorWithoutMutation) {
+    constexpr int kIds = MAX_REGISTERED_CALLABLE_IDS;
+    // One arena must hold every id at this image size, or the count limit is
+    // unreachable and the byte limit would be what this case measured.
+    static_assert(static_cast<size_t>(kIds) * 128 <= KernelCallableCache::kByteLimit);
     KernelCallableCache cache;
     FakeDevice device;
-    for (int id = 0; id < 64; ++id) {
-        ASSERT_EQ(prepare(cache, device, id, image(64, id)), 0);
+    for (int id = 0; id < kIds; ++id) {
+        ASSERT_EQ(prepare(cache, device, id, image(64, static_cast<uint8_t>(id))), 0);
         cache.commit(id);
     }
-    EXPECT_EQ(cache.resident_count(), 64);
+    EXPECT_EQ(cache.resident_count(), static_cast<size_t>(kIds));
     EXPECT_EQ(device.allocations, 1);
-    EXPECT_EQ(device.copies, 64);
-    EXPECT_EQ(cache.resident_bytes(), 64 * charge(image()));
-    EXPECT_EQ(cache.host_bytes(), 64 * image().size());
+    EXPECT_EQ(device.copies, kIds);
+    EXPECT_EQ(cache.resident_bytes(), kIds * charge(image()));
+    EXPECT_EQ(cache.host_bytes(), kIds * image().size());
     EXPECT_EQ(prepare(cache, device, -1, image(64, 255)), PTO_RUNTIME_ERR_CALLABLE_COUNT_EXCEEDED);
-    EXPECT_EQ(device.copies, 64);
+    EXPECT_EQ(device.copies, kIds);
     KernelCallableResidency found;
-    ASSERT_EQ(cache.resolve(63, found), 0);
-    EXPECT_EQ(found.device_address, 0x10000000 + 63 * charge(image()));
-    EXPECT_EQ(cache.resident_count(), 64);
+    ASSERT_EQ(cache.resolve(kIds - 1, found), 0);
+    EXPECT_EQ(found.device_address, 0x10000000 + (kIds - 1) * charge(image()));
+    EXPECT_EQ(cache.resident_count(), static_cast<size_t>(kIds));
 }
 
 TEST(KernelCallableCache, HistoricalPaddingDoesNotOverrideSignatureCounts) {

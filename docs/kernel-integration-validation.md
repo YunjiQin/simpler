@@ -291,15 +291,55 @@ this line's TMR consumer reads and #2190 has no source for, so it is 88 bytes
 against #2190's 56. And `consume_kernel_invocation` receives the whole prefix
 rather than the invocation header alone, for the same reason.
 
-`MAX_REGISTERED_CALLABLE_IDS` is still 64 here and 8192 in #2190. Registration
-is already pure on both lines, so every prepare spends an id permanently; the
-cap is the one part of #2190's contract this line has not taken, and raising it
-turns the AICPU's `orch_so_table_[MAX_REGISTERED_CALLABLE_IDS]` into a 2.3 MiB
-static array. That is an open decision, not an oversight.
-
 `mkdocs build --strict` was not re-run: mkdocs is not installed in this
 worktree and PyPI is unreachable from this host. The change adds no page and
 changes no nav entry.
+
+## Callable id cap revalidation (2026-09-14)
+
+`MAX_REGISTERED_CALLABLE_IDS` moves from 64 to 8192, matching #2190. This was
+the one part of #2190's contract this line had not taken, and registration is
+already pure on both, so every prepare spends an id permanently and 64 was the
+binding limit. Hardware work passed the architecture precheck and acquired
+devices through `task-submit`.
+
+| Suite | Result |
+| ----- | ------ |
+| Native builds: a2a3, a5, a2a3sim, a5sim, nanobind extension | all succeeded |
+| C++ unit tests, no hardware | 166/166 passed |
+| C++ unit tests with `SIMPLER_ENABLE_HARDWARE_TESTS=ON`, no hardware | 168/168 passed |
+| C++ hardware tests, `^requires_hardware(_a2a3)?$` | 2/2 passed |
+| Python unit tests, `tests/ut -m "not requires_hardware"` | 2428 passed |
+| Python hardware unit tests, `tests/ut -m requires_hardware --platform a2a3` | 31/31 passed |
+| a2a3 hardware, `tests/ut/py/test_kernel_mode_c_api.py` | 13/13 passed |
+| a2a3 hardware, `tests/st/a2a3/kernel_capture` | passed, 100 replays |
+| a2a3 onboard scenes, `-m "not sdma" --exclude-level 4` | 167 passed, 1 skipped |
+| a2a3 SDMA scenes | 3 passed |
+| a2a3sim scenes | 82 passed, 8 skipped |
+| a5sim scenes | 78 passed |
+| pre-commit hooks on changed files | passed |
+
+The AICPU cost is real and measured. `orch_so_table_[MAX_REGISTERED_CALLABLE_IDS]`
+is a fixed array of ~296-byte entries in the TMR AICPU executor, so
+`libaicpu_kernel.so`'s `.bss` grows from 450 KiB to 2.73 MiB. The device loads
+and runs it: the kernel C API and capture suites pass unchanged on a2a3. The
+entry is 86% `char path[256]`, which the kernel path never uses — it registers
+by `dev_orch_so_addr` — so moving `path` out of the resident table would return
+about 2 MiB. That is not done here.
+
+Four cases failed on the first pass and all pass on re-run:
+`test_kernel_device_query_rejections_keep_context_reusable[device_query_error]`
+and `[device_mismatch]`, and `TestWorkerAsyncWholeRunFifo::test_run` and
+`::test_prepared_run_device_control_waits_for_the_active_run`. The scene log
+names the cause: `rtStreamQuery (AICore) failed: 507901`, `EL9999 ... reason=hdc
+disconnect` on `dev=13` — the host lost its channel to that device mid-sweep.
+The change cannot reach those paths: it edits one constant and one unit test,
+and `MAX_REGISTERED_CALLABLE_IDS` appears nowhere under
+`src/*/runtime/host_build_graph/` or `src/common/host_build_graph/`, which is
+where `worker_async_fifo` runs. A targeted re-run of all four plus the rest of
+`worker_async_fifo` passed 9/9 on a fresh device pair, and the same two kernel
+cases had already passed 14/14 on this same code earlier in the session. The
+onboard row above records the re-run result.
 
 ## Remaining boundaries
 
