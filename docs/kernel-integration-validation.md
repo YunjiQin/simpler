@@ -5,7 +5,8 @@
 This records local integration of every submitted PR in the supplied kernel
 pipeline. It does not merge or change the GitHub PRs. The first audit froze
 these heads on 2026-09-11; the heads were re-surveyed on 2026-09-14, and the
-"Now" column is what each PR carried then. A head that moved is not by itself
+"Now" column is what each PR carried then, except #2190, which was re-read on
+2026-09-15 and is shown at that head. A head that moved is not by itself
 a change this line took — D15 in the integration log says which of the moves
 were adopted and which were deferred.
 
@@ -23,7 +24,7 @@ were adopted and which were deferred.
 | #2185 | C++, nanobind and Python kernel entry points | `32dd9442f79bb936541cf41a6a08d7838d450134` | `7058de9f9f4d` — adopted |
 | #2187 | Three-stream launch binder and compensation | `136e9712d22c495ac921a6900c8f24fa9b8ebcf3` | unchanged; its binder rewritten to the chained topology |
 | #2189 | K5 resident and per-invocation execution state | `b6435e4858b1e0443966d664cca478276baefa55` | unchanged |
-| #2190 | Callable cache, residency and generation validation | `2c876478dbf41fad5c0019f081261d912e9b687e` | `5f9895d7c0e4` — id shape adopted; block allocator not taken |
+| #2190 | Callable cache, residency and generation validation | `2c876478dbf41fad5c0019f081261d912e9b687e` | `08f7f9218728` — fully adopted, including the block allocator |
 | #2193 | K3 capacity refusal without releasing existing resources | `b8e739d9d8143ca6f35bf2177241976f900e2ab7` | unchanged |
 
 The two audited HBG heads were force-pushed away and are no longer fetchable;
@@ -387,7 +388,9 @@ which poisons the context instead of failing the registration cleanly. And the
 simulation `prepare_callable` calls the image validator too, so both entries
 agree that structural checks precede the lifecycle refusal; #2190's simulation
 entry reports `INVALID_STATE` for an image whose size clears the header floor
-but whose variable tail does not add up.
+but whose variable tail does not add up. The first of the two is no longer a
+divergence — #2190 restored those checks at `08f7f9218728`, in a better form
+this line then took; the newest-head section below has it.
 
 `kernel_arena_change_is_forbidden` is a third difference, but it is not one
 against #2190: it is mainline code from the merged K1 (#2064), so every branch
@@ -399,6 +402,71 @@ removes a guard `main` uses today in favour of a mechanism that exists only in
 an unmerged PR: `static_arena_bank.h` is on this line and on #2193, and nowhere
 else. If #2193 does not land in that shape, the rule has no carrier here. This
 is recorded as a risk, not a resolved question.
+
+`mkdocs build --strict` was not re-run: mkdocs is not installed in this
+worktree and PyPI is unreachable from this host. The change adds no page and
+changes no nav entry.
+
+## Newest-head review revalidation (2026-09-15)
+
+Re-reading #2190 at `08f7f9218728` closed two gaps in opposite directions.
+
+The first was this line's. `simpler_aicpu_kernel_exec` treats `packet_bytes` as
+the length of the region starting at `arg`, and its upper bound compared that
+`uint64_t` field against `SIZE_MAX` — never true on a 64-bit AICPU, so
+`arg + packet_bytes` could wrap. It is now bounded by the space actually left
+above `arg`, the shape #2190 reached first.
+
+The second was #2190's, and it came back improved. The lost child `func_id`
+range and duplicate checks, previously recorded here as a divergence, are back
+in that PR, bounded by a named `KERNEL_MAX_FUNC_ID` tied to
+`RUNTIME_MAX_FUNC_ID` by a `static_assert` in both `device_runner_base.cpp`
+files, where this line had used the extent of `ChipCallable::child_func_ids_`.
+That array's capacity is how many children an image may carry, not the size of
+the table the id indexes; they agree at 1024 only by coincidence, so widening
+the child capacity would have silently widened the accepted id range. #2190's
+expression is the correct one and is now this line's, along with the test it
+added. The accepted set is unchanged, so this is a provenance fix, not a
+behavior change.
+
+One divergence from #2190 remains, and it is deliberate. The simulation
+`prepare_callable` fallback validates the image before reporting that no
+kernel context is live, so a malformed image reports an argument error on both
+platforms; #2190's fallback reports `INVALID_STATE` for an image whose size
+clears the header floor but whose variable tail does not add up. The
+`kernel_arena_change_is_forbidden` question is unchanged and is still a
+difference against `main`, not against #2190 — see the section above.
+
+Hardware work passed the architecture precheck and acquired devices through
+`task-submit`.
+
+| Suite | Result |
+| ----- | ------ |
+| Native builds: a2a3, a5, a2a3sim, a5sim, nanobind extension | all succeeded |
+| C++ unit tests, no hardware | 166/166 passed |
+| C++ unit tests with `SIMPLER_ENABLE_HARDWARE_TESTS=ON`, no hardware | 168/168 passed |
+| C++ hardware tests, `^requires_hardware(_a2a3)?$` | 2/2 passed |
+| Python unit tests, `tests/ut -m "not requires_hardware"` | 2428 passed |
+| Python hardware unit tests, `tests/ut -m requires_hardware --platform a2a3` | 21/21 scheduled cases passed |
+| The ten cases that marker run drops, invoked by path | 10 passed |
+| a2a3 hardware, `tests/ut/py/test_kernel_mode_c_api.py` | 13/13 passed |
+| a2a3 hardware, `tests/st/a2a3/kernel_capture` | passed, 100 replays |
+| a2a3 onboard scenes, `-m "not sdma" --exclude-level 4` | 167 passed, 1 skipped |
+| a2a3 SDMA scenes | 3 passed |
+| a2a3sim scenes | 82 passed, 8 skipped |
+| a5sim scenes | 78 passed |
+| pre-commit hooks on changed files | passed |
+
+Every count matches the pre-change baseline, with no re-runs for failure.
+
+Two invocation details are load-bearing and cost a false red each before being
+recognised as harness form rather than regression. The C++ unit build must be
+configured with **no** `CMAKE_BUILD_TYPE`, as `docs/testing.md` shows it:
+`Release` defines `NDEBUG`, `debug_assert` becomes a no-op, and the three
+recording-refusal tests that assert on it stop throwing. And the C++ hardware
+tests need `--resource-spec-file`, built from `TASK_DEVICE` the way
+`.github/workflows/_ut-npu-a2a3.yml` builds it; without it `test_comm_lifecycle`
+sees an empty device pool and fails on the count rather than on behavior.
 
 `mkdocs build --strict` was not re-run: mkdocs is not installed in this
 worktree and PyPI is unreachable from this host. The change adds no page and

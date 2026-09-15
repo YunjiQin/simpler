@@ -727,3 +727,41 @@ the only producer either way.
 **Affects.** #2190 (shape adopted); #2180, #2189 (their consumer signature and
 TMR dispatch follow); D16 item 3 is superseded on the descriptor point only —
 the callable generation stays gone.
+
+## D18 - Take the func_id bound from the runtime table, not the child array
+
+**Problem.** D17's line of work restored two checks #2190's extraction of
+`validate_kernel_callable_image` had lost: a child `func_id` outside the device
+function table, or repeated within one image, has the device consumer overwrite
+a mapping it built earlier in the same invocation. This line expressed the range
+bound as `std::extent_v<decltype(ChipCallable::child_func_ids_)>`. #2190 has
+since restored the same two checks against `KERNEL_MAX_FUNC_ID`, a named
+constant in `callable_protocol.h` tied to `RUNTIME_MAX_FUNC_ID` by a
+`static_assert` in both `device_runner_base.cpp` files.
+
+**Finding.** The two bounds are both 1024 and that is a coincidence.
+`ChipCallable` is `Callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>`, so the
+array extent says how many children one image may carry. A `func_id` indexes
+the runtime's function table, whose size is `RUNTIME_MAX_FUNC_ID`. Nothing ties
+them: raising the child capacity would widen the accepted id range past the
+table the ids address, and the widening would be silent because the validator
+would still compile and still look right.
+
+**Choice.** Adopt #2190's expression, and its test with it.
+
+1. `KERNEL_MAX_FUNC_ID` joins `MAX_REGISTERED_CALLABLE_IDS` in
+   `callable_protocol.h`, with the comment saying the two id spaces are
+   independent.
+2. `validate_kernel_callable_image` bounds `func_id` by it.
+3. `static_assert(KERNEL_MAX_FUNC_ID == RUNTIME_MAX_FUNC_ID)` in the onboard and
+   simulation `device_runner_base.cpp`, the two translation units that see both
+   headers, so a change to either bound fails the build rather than the images.
+
+**Reason.** The accepted set does not move today, so this buys no behavior. It
+buys the constraint: the bound now names what it bounds, and drift between the
+two is a compile error instead of a class of image the device will accept and
+then mis-dispatch.
+
+**Affects.** #2190 (its shape adopted, closing the divergence this line had
+recorded against it); the simulation `prepare_callable` ordering remains the one
+deliberate difference.
