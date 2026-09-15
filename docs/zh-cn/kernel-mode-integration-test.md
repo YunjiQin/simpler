@@ -18,7 +18,7 @@ kernel 模式下，simpler 是一个被调用的库：它借用调用方已经�
 `tests/ut/py/test_kernel_mode_c_api.py` 里的
 `test_kernel_eager_launch_executes_fresh_tensor_and_scalar_snapshots`。它用 ctypes
 直接调用 host runtime 动态库，自己扮演调用方，不经过 PyTorch，也不经过 simpler
-的 Python Worker。
+的 Python Worker。走 Worker 的同一个算子见 §4.1。
 
 被执行的算子是一个 AIV 向量加标量，`y[i] = x[i] + scalar`：
 
@@ -80,6 +80,33 @@ simpler 没有调用过它们。
 
 init 期间的执行体加载和 prepare 期间的 callable 注册，会同步上下文自己的 AICPU
 stream。launch 路径不同步任何 stream。
+
+## 4.1 Python 侧的 Worker 入口
+
+上面四个是 C 入口。Python 侧对应的公开对象是 L2 `Worker`，构造时用
+`execution_mode` 选定分派面，之后只读：
+
+```python
+worker = Worker(level=2, execution_mode="kernel", device_id=d,
+                platform="a2a3", runtime="tensormap_and_ringbuffer")
+worker.init(config=cfg)                       # -> simpler_kernel_mode_init
+cid = worker.kernel_prepare_callable(chip)    # -> ..._prepare_callable，返回铸好的 id
+worker.kernel_launch(cid, args, stream)       # -> ..._launch，stream 每次显式传
+worker.close()                                # -> finalize_device
+```
+
+`config` 是 context 固定配置，kernel 模式必填、program 模式拒收；program 模式的
+`prewarm_config` 反之。init 与 prepare 都不收 stream，只有 launch 收，且不保存。
+两个分派面互斥：kernel 模式下 `register` / `submit` / `run` 被拒，program 模式下两个
+`kernel_*` 入口被拒，报错里点名构造时固定的模式。
+
+`kernel_prepare_callable` 是纯注册：同一个 callable 注册两次得到两个不同且都有效的
+id，没有去重也没有 lookup，容量按注册次数计。id 只在本 context 内有效、成功过的不
+复用，`close()` 之后整体失效——这三条合起来取代了 id 上的 generation 字段。
+
+Worker 层的端到端用例是 `tests/ut/py/test_worker/test_kernel_mode_entry.py` 的
+`test_worker_kernel_mode_eager_end_to_end`：与第 2 节的 C API 用例同一个向量加标量
+算子，同样由测试自己持有设备、stream 和显存，区别只是经过 Worker 而不是 ctypes。
 
 prepare 之后，测试自己同步一次 caller stream 再读 committed memory。prepare 的设备侧
 注册错误由它自己的返回值报告，不依赖这次同步。

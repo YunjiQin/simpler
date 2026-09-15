@@ -899,3 +899,70 @@ artifact of its own stub platform:
 
 **Affects.** #2185 (the remainder of its refreshed head adopted); D15 (its
 deferral of this PR closed).
+
+---
+
+## D21 - The L2 Worker owns the mode; init and close are shared, dispatch is not
+
+**Problem.** The target call-flow document names one runtime entry object for
+PyPTO — `simpler.worker.Worker(level=2, execution_mode="kernel")` — and lists
+its construction identity plus `init` / `prepare` / `launch` / `close` dispatch
+as the one simpler deliverable still marked 🔧. This line had only the
+`ChipWorker` surface: the native wrapper, one layer below the object PyPTO
+holds. Every kernel test drove `ChipWorker` or the C ABI directly, so nothing
+established that the public path exists at all.
+
+**Finding.** Three shapes are decided together, and the argument for each is
+that the alternative reintroduces something the design already removed.
+
+**Choice.**
+
+1. **The mode is fixed at construction, not chosen at `init`.** `Worker(level=2,
+   execution_mode="kernel")`; `program` is the default and every existing caller
+   keeps its meaning. A mode argument on `init` would make the two surfaces
+   reachable on one object before it, so `register()` on a not-yet-initialized
+   Worker could not say which surface it belongs to. Fixing it at construction
+   makes every refusal resolve from the constructor, before any device exists —
+   which is also what makes the mode contract testable without hardware.
+2. **`init` and `close` are shared; dispatch is not.** `init(config=...)` and
+   `close()` are one call in both modes, which is the unified init the document
+   asks for.
+   The dispatch surfaces stay disjoint and refuse each other by name:
+   `register` / `unregister` / `submit` / `run` are program-only,
+   `kernel_prepare_callable` / `kernel_launch` are kernel-only. Native refuses
+   the crossing too — the program entries bounds-check a kernel context's empty
+   slot storage, and the device context latches one mode write-once — so the
+   Python guard adds a diagnosis, not a safety property.
+3. **The kernel context's `CallConfig` is a new `config=` parameter, not
+   `prewarm_config`.** They are not the same object wearing two names:
+   `prewarm_config` is an optional ring-sizing hint for a later `run`, and the
+   kernel one is the context's required, immutable sizing, with no later `run`
+   to hint at. Each is refused in the other's mode rather than silently
+   ignored, because an ignored sizing config is exactly the failure that a
+   context fixed at init cannot report later.
+4. **Kernel mode is level 2 only.** L3+ forks a chip child per device, and a
+   forked child cannot inherit the borrowed device and stream the caller holds.
+   `level != 2` with `execution_mode="kernel"` is refused at construction.
+5. **`kernel_mode_supported` reports capability, not mode.** It answers for the
+   runtime the chip context bound — false before init, after a failed init,
+   after close, and on any L3+ Worker, which binds none of its own. A
+   program-mode L2 Worker answers for its runtime, exactly as `ChipWorker`
+   does.
+
+**Reason.** The Worker layer adds no mechanism: `init` reaches
+`ChipWorker.kernel_init`, `close` already finalizes the chip worker through the
+`CleanupJournal`, whose retry is what covers a failed kernel teardown, and
+prepare and launch forward under the same READY lease every other live-tree call
+takes. What it adds is the identity the three-party contract is written to, and
+the guarantee that a Worker constructed for one surface cannot reach the other.
+
+**Boundary.** `tests/ut/py/test_worker/test_kernel_mode_entry.py` now drives the
+public path end to end on a2a3 — init, two registrations of one image, two
+launches with different addresses and scalars, numeric verification, close, and
+a launch after close that the CLOSED state refuses. The capture boundary is
+unchanged by this entry: no test drives `Worker.kernel_launch` inside a captured
+graph, so D16's note stands.
+
+**Affects.** The target call-flow document's 🔧 row for the L2 Worker
+construction identity and lifecycle dispatch; D16 (its prepare/launch contract
+is what this surface exposes).
