@@ -66,27 +66,35 @@ prepare / launch / finalize 查询设备失败时原样返回查询错误；设�
 
 | 情况 | 行为 |
 | ---- | ---- |
-| 新注册（内容是否重复无关） | 铸造下一个 ID，使用固定代码区，修补私有副本并上传 |
+| 新注册，当前有块装得下 | 铸造下一个 ID，在该块内追加，修补私有副本并上传 |
+| 新注册，没有块装得下 | 再申请一块（见下），装不下则拒绝 |
 | 数量或字节预算超限 | 拒绝候选，出参写 `-1`，保留已有 ready 条目 |
 | 存在未 ready 的条目 | 拒绝后续 stage，防止暴露未完成准备的资源 |
 
-代码预算为 512 MiB；每次注册按 `align_up(callable_size, 64)` 计费，包含整个
+代码预算为 2 GiB；每次注册按 `align_up(callable_size, 64)` 计费，包含整个
 `ChipCallable`——预算按注册次数消耗，不按不同镜像数消耗。
 
-数量上限和字节预算哪个先到，取决于镜像大小。`sizeof(ChipCallable)` 是 9376 字节，
-所以 8192 个空壳镜像只占 73.5 MiB，数量先到；而带真实 orchestration SO 与 AICore
-二进制的镜像若为 1 MiB 量级，512 个就用满预算，字节先到。两个上限都会返回各自的
-错误码（`CALLABLE_COUNT_EXCEEDED` / `CALLABLE_BYTES_EXCEEDED`）。首次上传分配固定代码区和
-代码区，后续不扩容：
+设备内存按块申请、按需增长，不在首次注册就占满预算：
 
 ```text
-arena_（底层分配由 MemoryAllocator 持有）
-└── 512 MiB：按 64 字节对齐追加的代码镜像
-    └── device_address = arena_ + 当前 used_
+blocks_（每块的底层分配由 MemoryAllocator 持有）
+├── block[0]：max(charged, 2 MiB)
+├── block[1]：同上，前序块都装不下时才申请
+└── ...                                   Σ block.capacity ≤ 2 GiB
+    └── device_address = block.address + block.used
 ```
 
+单个注册大于 2 MiB 时该块按 `charged` 精确申请，已有块的剩余空间仍可被后续小镜像
+用掉。块的剩余量（slack）计入 `allocated_bytes()`，所以它对着 2 GiB 预算计费，而
+`resident_bytes()` 只算实际收费的镜像字节。已发布的 `device_address` 在增长时不移动。
+
+数量上限和字节预算哪个先到，取决于镜像大小 —— 分界点正好在 256 KiB：2 GiB / 8192
+= 256 KiB。小于它数量先到（`sizeof(ChipCallable)` 是 9376 字节，8192 个只占
+73.5 MiB），大于它字节先到（1 MiB 量级的镜像 2048 个就用满预算）。两个上限都会返回
+各自的错误码（`CALLABLE_COUNT_EXCEEDED` / `CALLABLE_BYTES_EXCEEDED`）。
+
 上传只修补临时 `scratch` 中的子 `CoreCallable::resolved_addr_`，调用者镜像保持不变。
-当前缓存上传仍通过 `Ops.copy → rtMemcpy(..., RT_MEMCPY_HOST_TO_DEVICE)` 同步复制代码和
+当前缓存上传仍通过 `Ops.copy → rtMemcpy(..., RT_MEMCPY_HOST_TO_DEVICE)` 同步复制，
 这不同于后续 runtime 注册的异步执行，也不意味着 prepare 会同步 stream/device。
 
 Host 条目保存驻留信息、镜像副本、计费字节数和 `ready`。

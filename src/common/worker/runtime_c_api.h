@@ -650,8 +650,10 @@ int simpler_kernel_mode_init(
  * arena capacity is spent per registration. An id is minted once and never
  * evicted, unregistered, or reused for the life of the context, which is what
  * lets launch resolve one without a version comparand; close invalidates every
- * id the context minted. The code arena holds 512 MiB of images, charged with
- * 64-byte alignment, plus a fixed descriptor prefix indexed by id.
+ * id the context minted. Device memory for the images is taken in 2 MiB
+ * blocks as registrations need it, up to 2 GiB of block capacity, and each
+ * registration is charged with 64-byte alignment; a published address never
+ * moves as the block set grows.
  * COUNT_EXCEEDED / BYTES_EXCEEDED reject admission before upload. No error
  * exits the process. A registration that fails on the device poisons the
  * context and retains its storage until an explicit close after

@@ -26,13 +26,19 @@ struct FakeDevice {
     int copy_error{0};
     bool fail_alloc{false};
     std::vector<uint8_t> last_upload;
+    std::vector<size_t> allocation_sizes;
+    uintptr_t next_address{0x10000000};
     KernelCallableCache::Ops ops() {
         return {
             this,
-            [](void *p, size_t) -> void * {
+            [](void *p, size_t bytes) -> void * {
                 auto &self = *static_cast<FakeDevice *>(p);
                 ++self.allocations;
-                return self.fail_alloc ? nullptr : reinterpret_cast<void *>(0x10000000);
+                if (self.fail_alloc) return nullptr;
+                self.allocation_sizes.push_back(bytes);
+                auto address = self.next_address;
+                self.next_address += bytes;
+                return reinterpret_cast<void *>(address);
             },
             [](void *p, void *, const void *src, size_t bytes) -> int {
                 auto &self = *static_cast<FakeDevice *>(p);
@@ -43,78 +49,120 @@ struct FakeDevice {
         };
     }
 };
-// `id` is the id registration is expected to mint, not one the caller picks.
 int prepare(KernelCallableCache &cache, FakeDevice &device, int id, const std::vector<uint8_t> &blob) {
-    int32_t minted = 99;
-    const int rc = cache.stage(reinterpret_cast<const ChipCallable *>(blob.data()), blob.size(), device.ops(), minted);
-    EXPECT_EQ(minted, rc == 0 ? id : -1);
+    int32_t actual_id = 99;
+    const int rc =
+        cache.stage(reinterpret_cast<const ChipCallable *>(blob.data()), blob.size(), device.ops(), actual_id);
+    EXPECT_EQ(actual_id, rc == 0 ? id : -1);
     return rc;
 }
 size_t charge(const std::vector<uint8_t> &blob) { return (blob.size() + 63) & ~size_t(63); }
 
-TEST(KernelCallableCache, EveryIdResidentThenCountErrorWithoutMutation) {
-    constexpr int kIds = MAX_REGISTERED_CALLABLE_IDS;
-    // One arena must hold every id at this image size, or the count limit is
-    // unreachable and the byte limit would be what this case measured.
-    static_assert(static_cast<size_t>(kIds) * 128 <= KernelCallableCache::kByteLimit);
+TEST(KernelCallableCache, Supports8192ResidentsWithoutMovingPublishedAddresses) {
     KernelCallableCache cache;
     FakeDevice device;
-    for (int id = 0; id < kIds; ++id) {
-        ASSERT_EQ(prepare(cache, device, id, image(64, static_cast<uint8_t>(id))), 0);
+    auto blob = image();
+    for (int id = 0; id < 8192; ++id) {
+        ASSERT_EQ(prepare(cache, device, id, blob), 0);
         cache.commit(id);
     }
-    EXPECT_EQ(cache.resident_count(), static_cast<size_t>(kIds));
-    EXPECT_EQ(device.allocations, 1);
-    EXPECT_EQ(device.copies, kIds);
-    EXPECT_EQ(cache.resident_bytes(), kIds * charge(image()));
-    EXPECT_EQ(cache.host_bytes(), kIds * image().size());
-    EXPECT_EQ(prepare(cache, device, -1, image(64, 255)), PTO_RUNTIME_ERR_CALLABLE_COUNT_EXCEEDED);
-    EXPECT_EQ(device.copies, kIds);
+    EXPECT_EQ(cache.resident_count(), 8192);
+    EXPECT_EQ(device.copies, 8192);
+    EXPECT_EQ(prepare(cache, device, -1, blob), PTO_RUNTIME_ERR_CALLABLE_COUNT_EXCEEDED);
+    blob.back() = 2;
+    EXPECT_EQ(prepare(cache, device, -1, blob), PTO_RUNTIME_ERR_CALLABLE_COUNT_EXCEEDED);
     KernelCallableResidency found;
-    ASSERT_EQ(cache.resolve(kIds - 1, found), 0);
-    EXPECT_EQ(found.device_address, 0x10000000 + (kIds - 1) * charge(image()));
-    EXPECT_EQ(cache.resident_count(), static_cast<size_t>(kIds));
+    ASSERT_EQ(cache.resolve(0, found), 0);
+    EXPECT_EQ(found.device_address, 0x10000000);
+    ASSERT_EQ(cache.resolve(8191, found), 0);
+    EXPECT_GT(found.device_address, 0x10000000);
 }
 
-TEST(KernelCallableCache, HistoricalPaddingDoesNotOverrideSignatureCounts) {
-    auto blob = image();
-    auto *callable = reinterpret_cast<ChipCallable *>(blob.data());
-    callable->sig_count_ = 2;
-    callable->signature_[0] = ArgDirection::OUT;
-    callable->signature_[1] = ArgDirection::SCALAR;
-    constexpr size_t padding_begin = offsetof(ChipCallable, config_name_len_) + sizeof(uint32_t);
-    std::memset(blob.data() + padding_begin, 0xff, offsetof(ChipCallable, storage_) - padding_begin);
-    ASSERT_EQ(KernelCallableCache::validate_image(callable, blob.size()), 0);
+TEST(KernelCallableCache, SmallImagesShareTwoMiBBlocksAndGrowthPreservesAddresses) {
+    constexpr size_t block = 2 * 1024 * 1024;
     KernelCallableCache cache;
     FakeDevice device;
+    auto blob = image(block / 2 - sizeof(ChipCallable));
     ASSERT_EQ(prepare(cache, device, 0, blob), 0);
     cache.commit(0);
-    EXPECT_EQ(device.copies, 1);
-    EXPECT_EQ(callable->scalar_count(), 1);
-    EXPECT_EQ(reinterpret_cast<const ChipCallable *>(device.last_upload.data())->scalar_count(), 1);
-}
-
-TEST(KernelCallableCache, RegistrationIsPureAndIdenticalContentTakesItsOwnIdAndUpload) {
-    KernelCallableCache cache;
-    FakeDevice device;
-    auto blob = image();
-    ASSERT_EQ(prepare(cache, device, 0, blob), 0);
-    cache.commit(0);
-    // The same bytes again are a second registration, not a lookup: a fresh id,
-    // its own upload and its own charge against the arena.
     ASSERT_EQ(prepare(cache, device, 1, blob), 0);
+    cache.commit(1);
+    EXPECT_EQ(device.allocation_sizes, std::vector<size_t>({block}));
+    ASSERT_EQ(prepare(cache, device, 2, blob), 0);
+    cache.commit(2);
+    EXPECT_EQ(device.allocation_sizes, std::vector<size_t>({block, block}));
+    KernelCallableResidency found;
+    ASSERT_EQ(cache.resolve(0, found), 0);
+    EXPECT_EQ(found.device_address, 0x10000000);
+    ASSERT_EQ(cache.resolve(2, found), 0);
+    EXPECT_EQ(found.device_address, 0x10000000 + block);
+}
+
+TEST(KernelCallableCache, LargeImageUsesExactAlignedAllocationAndKeepsSmallBlockTail) {
+    constexpr size_t block = 2 * 1024 * 1024;
+    KernelCallableCache cache;
+    FakeDevice device;
+    const auto small = image();
+    const auto large = image(block + 1);
+    ASSERT_EQ(prepare(cache, device, 0, small), 0);
+    cache.commit(0);
+    ASSERT_EQ(prepare(cache, device, 1, large), 0);
+    cache.commit(1);
+    ASSERT_EQ(prepare(cache, device, 2, small), 0);
+    cache.commit(2);
+    EXPECT_EQ(device.allocation_sizes, std::vector<size_t>({block, charge(large)}));
+    KernelCallableResidency found;
+    ASSERT_EQ(cache.resolve(2, found), 0);
+    EXPECT_EQ(found.device_address, 0x10000000 + charge(small));
+}
+
+TEST(KernelCallableCache, BlockSlackCountsTowardCapacityAndExistingTailRemainsUsable) {
+    constexpr size_t block = 2 * 1024 * 1024;
+    KernelCallableCache cache(2 * block);
+    FakeDevice device;
+    auto large = image(3 * block / 4 - sizeof(ChipCallable));
+    for (int id = 0; id < 2; ++id) {
+        ASSERT_EQ(prepare(cache, device, id, large), 0);
+        cache.commit(id);
+    }
+    EXPECT_EQ(prepare(cache, device, 2, large), PTO_RUNTIME_ERR_CALLABLE_BYTES_EXCEEDED);
+    EXPECT_EQ(device.allocation_sizes, std::vector<size_t>({block, block}));
+    auto small = image(block / 4 - sizeof(ChipCallable));
+    ASSERT_EQ(prepare(cache, device, 2, small), 0);
+    cache.commit(2);
+    ASSERT_EQ(prepare(cache, device, 3, small), 0);
+    cache.commit(3);
+    EXPECT_EQ(prepare(cache, device, 4, small), PTO_RUNTIME_ERR_CALLABLE_BYTES_EXCEEDED);
+    EXPECT_EQ(device.allocations, 2);
+}
+
+TEST(KernelCallableCache, EveryRegistrationUploadsANewImageAndReturnsANewId) {
+    KernelCallableCache cache;
+    FakeDevice device;
+    auto blob = image();
+    ASSERT_EQ(prepare(cache, device, 0, blob), 0);
+    const auto first_address = cache.pending_uploaded_address();
+    cache.commit(0);
+    EXPECT_EQ(cache.pending_uploaded_address(), 0);
+    ASSERT_EQ(prepare(cache, device, 1, blob), 0);
+    const auto second_address = cache.pending_uploaded_address();
+    EXPECT_NE(first_address, second_address);
     cache.commit(1);
     blob.back() = 2;
     ASSERT_EQ(prepare(cache, device, 2, blob), 0);
+    EXPECT_NE(cache.pending_uploaded_address(), second_address);
     cache.commit(2);
     EXPECT_EQ(device.copies, 3);
     EXPECT_EQ(device.allocations, 1);
     EXPECT_EQ(cache.resident_count(), 3);
-    EXPECT_EQ(cache.resident_bytes(), 3 * charge(image()));
-    KernelCallableResidency first, second;
+    EXPECT_EQ(cache.resident_bytes(), 3 * charge(blob));
+    EXPECT_EQ(cache.host_bytes(), 3 * blob.size());
+    KernelCallableResidency first;
+    KernelCallableResidency second;
     ASSERT_EQ(cache.resolve(0, first), 0);
     ASSERT_EQ(cache.resolve(1, second), 0);
-    EXPECT_NE(first.device_address, second.device_address);
+    EXPECT_EQ(first.device_address, first_address);
+    EXPECT_EQ(second.device_address, second_address);
 }
 
 TEST(KernelCallableCache, ExactByteBoundaryAndOneByteOver) {
@@ -136,7 +184,7 @@ TEST(KernelCallableCache, ExactByteBoundaryAndOneByteOver) {
     EXPECT_EQ(cache.resolve(0, found), 0);
 }
 
-TEST(KernelCallableCache, AlignmentPaddingConsumesBudgetAndExhaustsItPerRegistration) {
+TEST(KernelCallableCache, AlignmentPaddingConsumesBudgetAndIdenticalRegistrationStillFails) {
     auto blob = image(1);
     ASSERT_NE(blob.size(), charge(blob));
     KernelCallableCache too_small(blob.size());
@@ -146,8 +194,6 @@ TEST(KernelCallableCache, AlignmentPaddingConsumesBudgetAndExhaustsItPerRegistra
     KernelCallableCache cache(charge(blob));
     ASSERT_EQ(prepare(cache, device, 0, blob), 0);
     cache.commit(0);
-    // Capacity is spent per registration, so identical bytes do not fit in a
-    // budget the first registration already exhausted.
     EXPECT_EQ(prepare(cache, device, -1, blob), PTO_RUNTIME_ERR_CALLABLE_BYTES_EXCEEDED);
     EXPECT_EQ(cache.resident_bytes(), charge(blob));
     EXPECT_EQ(cache.host_bytes(), blob.size());
@@ -198,49 +244,20 @@ TEST(KernelCallableCache, RejectsMalformedSpansBeforeHashOrDeviceOperations) {
     auto blob = image();
     auto *chip = reinterpret_cast<ChipCallable *>(blob.data());
     chip->binary_size_ = UINT32_MAX;
-    EXPECT_EQ(prepare(cache, device, 0, blob), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(prepare(cache, device, 0, blob), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
     chip->binary_size_ = 64;
     chip->child_count_ = 1025;
-    EXPECT_EQ(prepare(cache, device, 0, blob), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(prepare(cache, device, 0, blob), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
     chip->child_count_ = 1;
     chip->child_offsets_[0] = UINT32_MAX;
-    EXPECT_EQ(prepare(cache, device, 0, blob), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(prepare(cache, device, 0, blob), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
     chip->child_offsets_[0] = 64;
-    EXPECT_EQ(prepare(cache, device, 0, blob), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(prepare(cache, device, 0, blob), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
     chip->child_count_ = 0;
     chip->func_name_len_ = CALLABLE_FUNC_NAME_MAX;
-    EXPECT_EQ(prepare(cache, device, 0, blob), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(prepare(cache, device, 0, blob), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
     EXPECT_EQ(device.allocations, 0);
     EXPECT_EQ(device.copies, 0);
-}
-
-TEST(KernelCallableCache, RejectsDuplicateAndOutOfRangeChildIdsBeforeDeviceOperations) {
-    const uint8_t code[] = {1, 2, 3};
-    const auto child = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, code, sizeof(code));
-    const std::vector<uint8_t> children[] = {child, child};
-    KernelCallableCache cache;
-    FakeDevice device;
-    for (int32_t invalid_id : {-1, 1024, INT32_MAX, 5}) {
-        const int32_t ids[] = {5, invalid_id};
-        const auto blob = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
-            nullptr, 0, "orch", code, sizeof(code), ids, children, 2, ""
-        );
-        EXPECT_EQ(prepare(cache, device, 0, blob), PTO_RUNTIME_ERR_INTERNAL);
-        EXPECT_EQ(cache.resident_count(), 0u);
-        EXPECT_EQ(cache.resident_bytes(), 0u);
-        EXPECT_EQ(device.allocations, 0);
-        EXPECT_EQ(device.copies, 0);
-    }
-
-    const int32_t boundary_ids[] = {0, 1023};
-    const auto valid = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
-        nullptr, 0, "orch", code, sizeof(code), boundary_ids, children, 2, ""
-    );
-    ASSERT_EQ(prepare(cache, device, 0, valid), 0);
-    cache.commit(0);
-    EXPECT_EQ(cache.resident_count(), 1u);
-    EXPECT_EQ(device.allocations, 1);
-    EXPECT_EQ(device.copies, 1);
 }
 
 TEST(KernelCallableCache, HostBackingIsImmutableAndResolveDoesNotAllocateOrUpload) {
@@ -250,11 +267,14 @@ TEST(KernelCallableCache, HostBackingIsImmutableAndResolveDoesNotAllocateOrUploa
     ASSERT_EQ(prepare(cache, device, 0, blob), 0);
     cache.commit(0);
     blob.back() = 2;
+    auto original = image();
+    ASSERT_EQ(prepare(cache, device, 1, original), 0);
+    cache.commit(1);
     KernelCallableResidency found;
     for (int i = 0; i < 100; ++i)
         ASSERT_EQ(cache.resolve(0, found), 0);
     EXPECT_EQ(device.allocations, 1);
-    EXPECT_EQ(device.copies, 1);
+    EXPECT_EQ(device.copies, 2);
     cache.clear();
     EXPECT_EQ(cache.resolve(0, found), PTO_RUNTIME_ERR_CALLABLE_NOT_RESIDENT);
     EXPECT_EQ(cache.host_bytes(), 0);
@@ -282,29 +302,99 @@ TEST(KernelCallableCache, ChildAddressesArePatchedOnlyInDeviceScratch) {
     auto *input = reinterpret_cast<ChipCallable *>(blob.data());
     input->child_count_ = 2;
     input->child_offsets_[1] = input->child_offsets_[0];
-    EXPECT_EQ(prepare(cache, device, 1, blob), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(prepare(cache, device, 1, blob), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
 }
 
-TEST(KernelCallableCache, ResolveSeparatesAnOutOfRangeIdFromAnUnregisteredOne) {
+TEST(KernelCallableCache, InvalidAndMissingIdsDoNotMutateResidents) {
     KernelCallableCache cache;
     FakeDevice device;
-    auto blob = image();
-    ASSERT_EQ(prepare(cache, device, 0, blob), 0);
+    ASSERT_EQ(prepare(cache, device, 0, image()), 0);
     cache.commit(0);
     KernelCallableResidency found;
-    ASSERT_EQ(cache.resolve(0, found), 0);
-    const auto address = found.device_address;
-    const auto copies = device.copies;
-    // An id the context could never have minted is an argument error; one it
-    // could have but did not is a residency answer. Neither mutates the cache.
     EXPECT_EQ(cache.resolve(-1, found), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
-    EXPECT_EQ(found.device_address, 0);
-    EXPECT_EQ(cache.resolve(MAX_REGISTERED_CALLABLE_IDS, found), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(cache.resolve(8192, found), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
     EXPECT_EQ(cache.resolve(1, found), PTO_RUNTIME_ERR_CALLABLE_NOT_RESIDENT);
-    ASSERT_EQ(cache.resolve(0, found), 0);
-    EXPECT_EQ(found.device_address, address);
-    EXPECT_EQ(device.copies, copies);
+    EXPECT_EQ(found.device_address, 0);
+    EXPECT_EQ(cache.resolve(0, found), 0);
+    EXPECT_EQ(found.device_address, 0x10000000);
+    EXPECT_EQ(device.copies, 1);
     EXPECT_EQ(cache.resident_count(), 1);
+}
+TEST(KernelCallableCache, FailedGrowthAndRollbackPreserveBlockBudgetAndResidents) {
+    constexpr size_t block = 2 * 1024 * 1024;
+    EXPECT_EQ(KernelCallableCache::kByteLimit, 2ULL * 1024 * 1024 * 1024);
+    KernelCallableCache cache(2 * block);
+    FakeDevice device;
+    auto blob = image(block - sizeof(ChipCallable));
+    ASSERT_EQ(prepare(cache, device, 0, blob), 0);
+    cache.commit(0);
+    device.fail_alloc = true;
+    EXPECT_EQ(prepare(cache, device, 1, blob), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(cache.allocated_bytes(), block);
+    device.fail_alloc = false;
+    device.copy_error = -123;
+    EXPECT_EQ(prepare(cache, device, 1, blob), -123);
+    EXPECT_EQ(cache.allocated_bytes(), 2 * block);
+    EXPECT_EQ(cache.resident_bytes(), block);
+    device.copy_error = 0;
+    ASSERT_EQ(prepare(cache, device, 1, blob), 0);
+    const auto address = cache.pending_uploaded_address();
+    cache.rollback(1);
+    ASSERT_EQ(prepare(cache, device, 1, blob), 0);
+    EXPECT_EQ(cache.pending_uploaded_address(), address);
+    cache.commit(1);
+    EXPECT_EQ(device.allocations, 3);
+    EXPECT_EQ(cache.resident_bytes(), 2 * block);
+    KernelCallableResidency found;
+    ASSERT_EQ(cache.resolve(0, found), 0);
+    EXPECT_EQ(found.device_address, 0x10000000);
+    EXPECT_EQ(prepare(cache, device, 2, blob), PTO_RUNTIME_ERR_CALLABLE_BYTES_EXCEEDED);
+}
+TEST(KernelCallableCache, HistoricalPaddingDoesNotOverrideSignatureCounts) {
+    auto blob = image();
+    auto *callable = reinterpret_cast<ChipCallable *>(blob.data());
+    callable->sig_count_ = 2;
+    callable->signature_[0] = ArgDirection::OUT;
+    callable->signature_[1] = ArgDirection::SCALAR;
+    constexpr size_t padding_begin = offsetof(ChipCallable, config_name_len_) + sizeof(uint32_t);
+    std::memset(blob.data() + padding_begin, 0xff, offsetof(ChipCallable, storage_) - padding_begin);
+    ASSERT_EQ(KernelCallableCache::validate_image(callable, blob.size()), 0);
+    KernelCallableCache cache;
+    FakeDevice device;
+    ASSERT_EQ(prepare(cache, device, 0, blob), 0);
+    cache.commit(0);
+    EXPECT_EQ(device.copies, 1);
+    EXPECT_EQ(callable->scalar_count(), 1);
+    EXPECT_EQ(reinterpret_cast<const ChipCallable *>(device.last_upload.data())->scalar_count(), 1);
+}
+
+TEST(KernelCallableCache, RejectsDuplicateAndOutOfRangeChildIdsBeforeDeviceOperations) {
+    const uint8_t code[] = {1, 2, 3};
+    const auto child = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, code, sizeof(code));
+    const std::vector<uint8_t> children[] = {child, child};
+    KernelCallableCache cache;
+    FakeDevice device;
+    for (int32_t invalid_id : {-1, 1024, INT32_MAX, 5}) {
+        const int32_t ids[] = {5, invalid_id};
+        const auto blob = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
+            nullptr, 0, "orch", code, sizeof(code), ids, children, 2, ""
+        );
+        EXPECT_EQ(prepare(cache, device, 0, blob), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+        EXPECT_EQ(cache.resident_count(), 0u);
+        EXPECT_EQ(cache.resident_bytes(), 0u);
+        EXPECT_EQ(device.allocations, 0);
+        EXPECT_EQ(device.copies, 0);
+    }
+
+    const int32_t boundary_ids[] = {0, 1023};
+    const auto valid = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
+        nullptr, 0, "orch", code, sizeof(code), boundary_ids, children, 2, ""
+    );
+    ASSERT_EQ(prepare(cache, device, 0, valid), 0);
+    cache.commit(0);
+    EXPECT_EQ(cache.resident_count(), 1u);
+    EXPECT_EQ(device.allocations, 1);
+    EXPECT_EQ(device.copies, 1);
 }
 
 TEST(KernelCallableCache, MintedIdsAreSequentialAndCloseInvalidatesThemAll) {

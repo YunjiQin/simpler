@@ -547,12 +547,11 @@ set_tests_properties(test_kernel_callable_cache PROPERTIES LABELS "no_hardware")
 foreach(dispatch_test test_kernel_dispatch test_kernel_dispatch_unavailable)
     add_common_utils_test(${dispatch_test} common/${dispatch_test}.cpp)
     target_sources(${dispatch_test} PRIVATE
-        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/kernel_dispatch.cpp)
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/kernel_dispatch.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/kernel_invocation_consumer.cpp)
     target_include_directories(${dispatch_test} PRIVATE
         ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface)
 endforeach()
-target_sources(test_kernel_dispatch_unavailable PRIVATE
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/kernel_invocation_consumer.cpp)
 set_tests_properties(test_kernel_dispatch_unavailable PROPERTIES LABELS "no_hardware")
 
 # Kernel-mode phase machine and restricted-vocabulary tables, table-driven with

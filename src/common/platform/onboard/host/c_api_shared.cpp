@@ -1357,12 +1357,12 @@ int simpler_kernel_mode_init(
 int simpler_kernel_mode_prepare_callable(
     DeviceContextHandle ctx, const void *callable, size_t callable_size, int32_t *out_callable_id
 ) {
+    if (out_callable_id != nullptr) *out_callable_id = -1;
     int rc = validate_kernel_prepare_callable_args(ctx, callable, callable_size, out_callable_id);
-    if (rc != 0) {
-        if (out_callable_id != nullptr) *out_callable_id = -1;
-        return rc;
-    }
-    *out_callable_id = -1;
+    if (rc != 0) return rc;
+    if (callable_size > KernelCallableCache::kByteLimit) return PTO_RUNTIME_ERR_CALLABLE_BYTES_EXCEEDED;
+    rc = validate_kernel_callable_image(callable, callable_size);
+    if (rc != 0) return rc;
 
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
     std::lock_guard<std::mutex> submission_lock(runner->kernel_submission_mutex());

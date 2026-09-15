@@ -341,6 +341,69 @@ where `worker_async_fifo` runs. A targeted re-run of all four plus the rest of
 cases had already passed 14/14 on this same code earlier in the session. The
 onboard row above records the re-run result.
 
+## Callable cache alignment revalidation (2026-09-14)
+
+The callable cache and the shared entry validation are now #2190's: device
+memory comes in 2 MiB blocks up to a 2 GiB budget instead of one 512 MiB arena
+committed on first use, and the structural image validation lives once in
+`validate_kernel_callable_image` rather than being duplicated between the entry
+and the cache. Hardware work passed the architecture precheck and acquired
+devices through `task-submit`.
+
+| Suite | Result |
+| ----- | ------ |
+| Native builds: a2a3, a5, a2a3sim, a5sim, nanobind extension | all succeeded |
+| C++ unit tests, no hardware | 166/166 passed |
+| C++ unit tests with `SIMPLER_ENABLE_HARDWARE_TESTS=ON`, no hardware | 168/168 passed |
+| C++ hardware tests, `^requires_hardware(_a2a3)?$` | 2/2 passed |
+| Python unit tests, `tests/ut -m "not requires_hardware"` | 2428 passed |
+| Python hardware unit tests, `tests/ut -m requires_hardware --platform a2a3` | 31/31 passed |
+| a2a3 hardware, `tests/ut/py/test_kernel_mode_c_api.py` | 13/13 passed |
+| a2a3 hardware, `tests/st/a2a3/kernel_capture` | passed, 100 replays |
+| a2a3 onboard scenes, `-m "not sdma" --exclude-level 4` | 167 passed, 1 skipped |
+| a2a3 SDMA scenes | 3 passed |
+| a2a3sim scenes | 82 passed, 8 skipped |
+| a5sim scenes | 78 passed |
+| pre-commit hooks on changed files | passed |
+
+Every scene and unit count matches the pre-change baseline, with no re-runs.
+
+The first registration no longer commits the whole budget: it takes
+`max(charged, 2 MiB)`, and a registration larger than a block gets a block
+sized exactly to it while earlier blocks keep their usable tails. Block slack
+is charged against the 2 GiB budget through `allocated_bytes()`, while
+`resident_bytes()` still counts only charged image bytes, and a published
+`device_address` never moves as blocks are added.
+
+Which admission limit binds first now crosses over at 256 KiB, since
+2 GiB / 8192 is exactly that: below it the id count binds, above it the byte
+budget does.
+
+Two things stay divergent from #2190 on purpose.
+`validate_kernel_callable_image` additionally rejects a child `func_id` that is
+out of range or repeated within one image, two checks #2190's extraction lost;
+without them a malformed image is caught only by the device consumer at launch,
+which poisons the context instead of failing the registration cleanly. And the
+simulation `prepare_callable` calls the image validator too, so both entries
+agree that structural checks precede the lifecycle refusal; #2190's simulation
+entry reports `INVALID_STATE` for an image whose size clears the header floor
+but whose variable tail does not add up.
+
+`kernel_arena_change_is_forbidden` is a third difference, but it is not one
+against #2190: it is mainline code from the merged K1 (#2064), so every branch
+off `main` carries it, #2190 included. This line **deleted** it — D14 item 4 — and
+routes the same rule through K3's `commit_static_arena_bank`, which applies it
+to onboard and simulation from one place instead of an inline scan in
+`setup_static_arena`. The consolidation is sound on its own terms, but it
+removes a guard `main` uses today in favour of a mechanism that exists only in
+an unmerged PR: `static_arena_bank.h` is on this line and on #2193, and nowhere
+else. If #2193 does not land in that shape, the rule has no carrier here. This
+is recorded as a risk, not a resolved question.
+
+`mkdocs build --strict` was not re-run: mkdocs is not installed in this
+worktree and PyPI is unreachable from this host. The change adds no page and
+changes no nav entry.
+
 ## Remaining boundaries
 
 - H4 has no submitted PR in the supplied pipeline. HBG kernel capability is
