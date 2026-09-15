@@ -15,21 +15,18 @@
 
 #include "chip_callable_layout.h"
 #include "callable_protocol.h"
-#include "kernel_callable_residency.h"
 #include "runtime_c_api.h"
 
 struct KernelCallableResidency {
     int32_t callable_id{-1};
     uint64_t device_address{0};
     size_t bytes{0};
-    uint64_t descriptor_address{0};
 };
 
 // The caller serializes prepare/resolve/close. Entries and arena addresses
 // remain immutable until external quiescence permits context close.
 class KernelCallableCache {
 public:
-    static constexpr size_t kDescriptorBytes = MAX_REGISTERED_CALLABLE_IDS * sizeof(KernelCallableDeviceResidency);
     static constexpr size_t kByteLimit = 512ULL * 1024 * 1024;
 
     explicit KernelCallableCache(size_t byte_limit = kByteLimit) :
@@ -67,7 +64,7 @@ public:
         const size_t charged = bytes + padding;
         const auto id = static_cast<int32_t>(entries_.size());
         Entry candidate;
-        candidate.residency = {id, 0, bytes, 0};
+        candidate.residency = {id, 0, bytes};
         candidate.image = std::vector<uint8_t>(
             reinterpret_cast<const uint8_t *>(callable), reinterpret_cast<const uint8_t *>(callable) + bytes
         );
@@ -75,26 +72,15 @@ public:
         entries_.push_back(std::move(candidate));
         try {
             auto &entry = entries_.back();
-            if (!arena_) arena_ = ops.allocate(ops.context, kDescriptorBytes + byte_limit_);
+            if (!arena_) arena_ = ops.allocate(ops.context, byte_limit_);
             if (!arena_) {
                 entries_.pop_back();
                 return PTO_RUNTIME_ERR_INTERNAL;
             }
-            entry.residency.device_address = reinterpret_cast<uint64_t>(arena_) + kDescriptorBytes + used_;
+            entry.residency.device_address = reinterpret_cast<uint64_t>(arena_) + used_;
             std::vector<uint8_t> scratch(entry.image);
             patch_chip_callable_scratch_for_device(callable, layout, entry.residency.device_address, scratch.data());
             rc = ops.copy(ops.context, reinterpret_cast<void *>(entry.residency.device_address), scratch.data(), bytes);
-            if (rc != 0) {
-                entries_.pop_back();
-                return rc;
-            }
-            entry.residency.descriptor_address =
-                reinterpret_cast<uint64_t>(arena_) + id * sizeof(KernelCallableDeviceResidency);
-            KernelCallableDeviceResidency descriptor{entry.residency.device_address, bytes, id, 0};
-            rc = ops.copy(
-                ops.context, reinterpret_cast<void *>(entry.residency.descriptor_address), &descriptor,
-                sizeof(descriptor)
-            );
             if (rc != 0) {
                 entries_.pop_back();
                 return rc;

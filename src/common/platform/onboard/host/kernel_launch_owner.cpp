@@ -35,7 +35,7 @@ int DeviceRunnerBase::launch_kernel_callable(
         reinterpret_cast<uint64_t>(persistent_args_.device_k_args()), kernel_static_config_.generation()
     };
     if (packet.encode(
-            args, residency.descriptor_address, binding, arena_banks_[0]->cached_gm_sm_size,
+            args, residency.device_address, residency.bytes, binding, arena_banks_[0]->cached_gm_sm_size,
             arena_banks_[0]->cached_runtime_arena_size
         ) != simpler::kernel::InvocationStatus::Ok)
         return PTO_RUNTIME_ERR_INTERNAL;

@@ -259,6 +259,48 @@ than that it makes exactly one more `rtFree` call.
 and PyPI is unreachable from this host. The change adds no page and changes no
 nav entry.
 
+## Device-entry sync revalidation (2026-09-14)
+
+The device entry was brought onto #2190's restored shape: the launch packet
+carries the callable's device image address and extent, and the residency
+descriptor is deleted. The decisions are D17 in the integration log. Hardware
+work passed the architecture precheck and acquired devices through
+`task-submit`.
+
+| Suite | Result |
+| ----- | ------ |
+| Native builds: a2a3, a5, a2a3sim, a5sim, nanobind extension | all succeeded |
+| C++ unit tests, no hardware | 166/166 passed |
+| C++ unit tests with `SIMPLER_ENABLE_HARDWARE_TESTS=ON`, no hardware | 168/168 passed |
+| C++ hardware tests, `^requires_hardware(_a2a3)?$` | 2/2 passed |
+| Python unit tests, `tests/ut -m "not requires_hardware"` | 2428 passed |
+| Python hardware unit tests, `tests/ut -m requires_hardware --platform a2a3` | 31/31 passed |
+| a2a3 hardware, `tests/ut/py/test_kernel_mode_c_api.py` | 13/13 passed |
+| a2a3 hardware, `tests/st/a2a3/kernel_capture` | passed, 100 replays |
+| a2a3 onboard scenes, `-m "not sdma" --exclude-level 4` | 167 passed, 1 skipped |
+| a2a3 SDMA scenes | 3 passed |
+| a2a3sim scenes | 82 passed, 8 skipped |
+| a5sim scenes | 78 passed |
+| pre-commit hooks on changed files | passed |
+
+Every scene and unit count matches the pre-change baseline exactly.
+
+Two divergences from #2190 remain deliberate. The packet prefix keeps
+`binding_address`, `context_generation`, `sm_bytes` and `arena_bytes`, which
+this line's TMR consumer reads and #2190 has no source for, so it is 88 bytes
+against #2190's 56. And `consume_kernel_invocation` receives the whole prefix
+rather than the invocation header alone, for the same reason.
+
+`MAX_REGISTERED_CALLABLE_IDS` is still 64 here and 8192 in #2190. Registration
+is already pure on both lines, so every prepare spends an id permanently; the
+cap is the one part of #2190's contract this line has not taken, and raising it
+turns the AICPU's `orch_so_table_[MAX_REGISTERED_CALLABLE_IDS]` into a 2.3 MiB
+static array. That is an open decision, not an oversight.
+
+`mkdocs build --strict` was not re-run: mkdocs is not installed in this
+worktree and PyPI is unreachable from this host. The change adds no page and
+changes no nav entry.
+
 ## Remaining boundaries
 
 - H4 has no submitted PR in the supplied pipeline. HBG kernel capability is

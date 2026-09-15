@@ -23,8 +23,6 @@ std::vector<uint8_t> image(size_t payload = 64, uint8_t value = 1) {
 struct FakeDevice {
     int allocations{0};
     int copies{0};
-    int descriptors{0};
-    KernelCallableDeviceResidency descriptor{};
     int copy_error{0};
     bool fail_alloc{false};
     std::vector<uint8_t> last_upload;
@@ -38,11 +36,6 @@ struct FakeDevice {
             },
             [](void *p, void *, const void *src, size_t bytes) -> int {
                 auto &self = *static_cast<FakeDevice *>(p);
-                if (bytes == sizeof(KernelCallableDeviceResidency)) {
-                    ++self.descriptors;
-                    std::memcpy(&self.descriptor, src, bytes);
-                    return self.copy_error;
-                }
                 ++self.copies;
                 self.last_upload.assign(static_cast<const uint8_t *>(src), static_cast<const uint8_t *>(src) + bytes);
                 return self.copy_error;
@@ -75,7 +68,7 @@ TEST(KernelCallableCache, SixtyFourResidentsThenCountErrorWithoutMutation) {
     EXPECT_EQ(device.copies, 64);
     KernelCallableResidency found;
     ASSERT_EQ(cache.resolve(63, found), 0);
-    EXPECT_EQ(found.device_address, 0x10000000 + KernelCallableCache::kDescriptorBytes + 63 * charge(image()));
+    EXPECT_EQ(found.device_address, 0x10000000 + 63 * charge(image()));
     EXPECT_EQ(cache.resident_count(), 64);
 }
 
@@ -93,7 +86,6 @@ TEST(KernelCallableCache, HistoricalPaddingDoesNotOverrideSignatureCounts) {
     ASSERT_EQ(prepare(cache, device, 0, blob), 0);
     cache.commit(0);
     EXPECT_EQ(device.copies, 1);
-    EXPECT_EQ(device.descriptors, 1);
     EXPECT_EQ(callable->scalar_count(), 1);
     EXPECT_EQ(reinterpret_cast<const ChipCallable *>(device.last_upload.data())->scalar_count(), 1);
 }
@@ -175,7 +167,7 @@ TEST(KernelCallableCache, PendingEntryIsNotLaunchableAndRollbackPreservesResiden
     ASSERT_EQ(prepare(cache, device, 1, second), 0);
     cache.commit(1);
     EXPECT_EQ(cache.resolve(1, found), 0);
-    EXPECT_EQ(found.device_address, 0x10000000 + KernelCallableCache::kDescriptorBytes + charge(first));
+    EXPECT_EQ(found.device_address, 0x10000000 + charge(first));
 }
 
 TEST(KernelCallableCache, AllocationAndCopyFailuresAreRetryable) {
@@ -234,7 +226,6 @@ TEST(KernelCallableCache, RejectsDuplicateAndOutOfRangeChildIdsBeforeDeviceOpera
         EXPECT_EQ(cache.resident_bytes(), 0u);
         EXPECT_EQ(device.allocations, 0);
         EXPECT_EQ(device.copies, 0);
-        EXPECT_EQ(device.descriptors, 0);
     }
 
     const int32_t boundary_ids[] = {0, 1023};
@@ -246,7 +237,6 @@ TEST(KernelCallableCache, RejectsDuplicateAndOutOfRangeChildIdsBeforeDeviceOpera
     EXPECT_EQ(cache.resident_count(), 1u);
     EXPECT_EQ(device.allocations, 1);
     EXPECT_EQ(device.copies, 1);
-    EXPECT_EQ(device.descriptors, 1);
 }
 
 TEST(KernelCallableCache, HostBackingIsImmutableAndResolveDoesNotAllocateOrUpload) {
@@ -289,28 +279,6 @@ TEST(KernelCallableCache, ChildAddressesArePatchedOnlyInDeviceScratch) {
     input->child_count_ = 2;
     input->child_offsets_[1] = input->child_offsets_[0];
     EXPECT_EQ(prepare(cache, device, 1, blob), PTO_RUNTIME_ERR_INTERNAL);
-}
-
-TEST(KernelCallableCache, DeviceComparandRejectsAWrongCallableAndAWrongMode) {
-    KernelCallableCache cache;
-    FakeDevice device;
-    auto blob = image();
-    ASSERT_EQ(prepare(cache, device, 0, blob), 0);
-    cache.commit(0);
-    SimplerKernelInvocationHeader invocation{};
-    invocation.mode = SIMPLER_MODE_KERNEL;
-    invocation.callable_id = 0;
-    EXPECT_TRUE(kernel_callable_residency_matches(invocation, device.descriptor));
-    invocation.callable_id = 3;
-    EXPECT_FALSE(kernel_callable_residency_matches(invocation, device.descriptor));
-    invocation.callable_id = -1;
-    EXPECT_FALSE(kernel_callable_residency_matches(invocation, device.descriptor));
-    invocation.callable_id = 0;
-    invocation.mode = SIMPLER_MODE_PROGRAM;
-    EXPECT_FALSE(kernel_callable_residency_matches(invocation, device.descriptor));
-    KernelCallableResidency found;
-    ASSERT_EQ(cache.resolve(0, found), 0);
-    EXPECT_EQ(found.descriptor_address, 0x10000000);
 }
 
 TEST(KernelCallableCache, ResolveSeparatesAnOutOfRangeIdFromAnUnregisteredOne) {

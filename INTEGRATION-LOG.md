@@ -670,3 +670,60 @@ test, so two-hop capture propagation through the real entries remains unproven.
 
 **Affects.** #2176, #2180, #2185, #2189, #2190 (their shapes adopted); #2187
 (its binder rewritten to the chained topology); D3, D7, D8, D9 (superseded).
+
+---
+
+## D17 - Follow #2190's device entry: the image span travels in the packet
+
+**Problem.** D16 kept this line's residency descriptor: a 24-byte device struct
+per callable, uploaded at registration into a fixed prefix of the code arena,
+whose address the packet carried so the AICPU could read the image address and
+extent from it. #2190 has since restored its device entry without a descriptor
+at all — `SimplerKernelDispatchArgs` carries `chip_callable_address` and
+`chip_callable_bytes` directly, and the consumer receives the `ChipCallable`
+reference.
+
+**Finding.** The descriptor bought two things and only one of them was real.
+
+The stated one was revocation: the entry re-read the slot on every invocation
+"including graph replay", so the host had one small location it could
+invalidate. Nothing ever wrote a descriptor after commit — ids are never
+evicted, kernel-mode `unregister_callable` returns `INVALID_STATE`, and
+`clear()` only drops host metadata — so the capability was never exercised. And
+it would not have helped the case that matters: after close the arena is freed,
+which leaves the descriptor address dangling exactly as the image address does.
+
+The real one was keeping the extent out of the per-call packet, so a packet
+could name *which* descriptor but could not widen the window the device parses.
+That argument assumes an untrusted packet, and the packet is built by the host
+binder from `cache.resolve()`. It is not part of this contract's threat model.
+
+**Choice.** Adopt #2190's shape.
+
+1. `SimplerKernelDispatchArgs` replaces `residency_address` with
+   `chip_callable_address` and `chip_callable_bytes`. This line keeps the four
+   binding fields #2190 has no source for — `binding_address`,
+   `context_generation`, `sm_bytes`, `arena_bytes` — because its TMR consumer
+   reads them; the prefix is 88 bytes against #2190's 56.
+2. `KernelCallableDeviceResidency` and its header are deleted. The code arena
+   loses its descriptor prefix, so `device_address` is `arena_ + used_`.
+3. `consume_kernel_invocation` takes
+   `(args, const ChipCallable &, callable_bytes, payload, payload_bytes)`. This
+   line passes the whole prefix where #2190 passes only the invocation header,
+   for the same reason as item 1; it is otherwise #2190's signature.
+4. The entry validates the span — non-null, `alignof(ChipCallable)`, at least
+   `sizeof(ChipCallable)`, no wraparound — and performs no device read. Cache
+   visibility for the image moves to the consumer, which is where the image is
+   actually parsed.
+5. `KernelDispatchStatus` drops `NotResident` and `Stale`; the entry no longer
+   produces them. 2 and 3 stay retired rather than being reused.
+
+**Reason.** One indirection and one device read per launch disappear, the
+descriptor prefix and its upload disappear, and the two lines stop diverging on
+a wire struct. Nothing that was load-bearing is lost: the image address and
+extent still come from the context's own committed residency, and the host is
+the only producer either way.
+
+**Affects.** #2190 (shape adopted); #2180, #2189 (their consumer signature and
+TMR dispatch follow); D16 item 3 is superseded on the descriptor point only —
+the callable generation stays gone.

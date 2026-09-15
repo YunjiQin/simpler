@@ -72,19 +72,17 @@ prepare / launch / finalize 查询设备失败时原样返回查询错误；设�
 
 代码预算为 512 MiB；每次注册按 `align_up(callable_size, 64)` 计费，包含整个
 `ChipCallable`——预算按注册次数消耗，不按不同镜像数消耗。首次上传分配固定代码区和
-描述符前缀，后续不扩容：
+代码区，后续不扩容：
 
 ```text
 arena_（底层分配由 MemoryAllocator 持有）
-├── 1.5 KiB：64 × KernelCallableDeviceResidency（每项 24 字节）
-│   └── descriptor_address = arena_ + callable_id × 24
 └── 512 MiB：按 64 字节对齐追加的代码镜像
-    └── device_address = arena_ + 2048 + 当前 used_
+    └── device_address = arena_ + 当前 used_
 ```
 
 上传只修补临时 `scratch` 中的子 `CoreCallable::resolved_addr_`，调用者镜像保持不变。
 当前缓存上传仍通过 `Ops.copy → rtMemcpy(..., RT_MEMCPY_HOST_TO_DEVICE)` 同步复制代码和
-描述符；这不同于后续 runtime 注册的异步执行，也不意味着 prepare 会同步 stream/device。
+这不同于后续 runtime 注册的异步执行，也不意味着 prepare 会同步 stream/device。
 
 Host 条目保存驻留信息、镜像副本、计费字节数和 `ready`。
 `resident_count()` 只统计 ready 项，`resident_bytes()` 包括未 commit 的计费占用。
@@ -137,12 +135,14 @@ launch 不分配设备内存、不创建 stream/event、不同步、不查询 ca
 返回 0 表示提交成功，最终数值和异步错误须由调用者同步后检查。
 
 设备包是 [SimplerKernelDispatchArgs](../../src/common/task_interface/kernel_dispatch_args.h)
-加 runtime payload。前缀包含包长、驻留描述符地址、context 的 `KernelArgs` 地址和
-context generation、SM/arena 范围及 `SimplerKernelInvocationHeader`。公共 invocation
-header 固定为 32 字节，不带 callable generation 字段；`host_copy_tensor_count` 和显式
-`reserved_` 必须为零。
+加 runtime payload。前缀包含包长、本次 callable 的设备镜像地址与长度、context 的
+`KernelArgs` 地址和 context generation、SM/arena 范围及 `SimplerKernelInvocationHeader`。
+镜像地址由 binder 从本 context 已提交的驻留信息填入，不来自调用方镜像；该分配在每个
+引用它的图销毁前不释放。公共 invocation header 固定为 32 字节，不带 callable generation
+字段；`host_copy_tensor_count` 和显式 `reserved_` 必须为零。
 
-设备入口先检查公共 framing 和驻留描述符，再由 TMR consumer 校验绑定、大小、参数数量和
+设备入口先检查公共 framing 和镜像跨度（非零、对齐、不小于 `sizeof(ChipCallable)`、
+不溢出），再由 TMR consumer 建立缓存可见性并校验绑定、大小、参数数量和
 signature，解码到本次调用的私有参数，进入真实 executor。
 HBG payload 尚未接入执行 consumer。
 

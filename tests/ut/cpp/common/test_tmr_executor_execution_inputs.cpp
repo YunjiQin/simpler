@@ -27,7 +27,6 @@
 #include "common/kernel_args.h"
 #include "host_log.h"
 #include "kernel_dispatch_args.h"
-#include "kernel_callable_residency.h"
 #include "tensormap_and_ringbuffer/kernel_dispatch.h"
 #include "tensormap_and_ringbuffer/kernel_execution_inputs.h"
 #include "worker/tmr_kernel_invocation.h"
@@ -169,7 +168,6 @@ protected:
             constexpr size_t padding_begin = offsetof(ChipCallable, config_name_len_) + sizeof(uint32_t);
             std::memset(image.data() + padding_begin, 0xff, offsetof(ChipCallable, storage_) - padding_begin);
         }
-        KernelCallableDeviceResidency residency{reinterpret_cast<uint64_t>(image.data()), image.size(), id, 0};
         TmrEncodingCache cache;
         TmrEncodingCandidate encoded;
         auto invocation_args = arguments(value);
@@ -180,7 +178,8 @@ protected:
         std::vector<uint64_t> storage((bytes + sizeof(uint64_t) - 1) / sizeof(uint64_t));
         auto *packet = reinterpret_cast<SimplerKernelDispatchArgs *>(storage.data());
         packet->packet_bytes = bytes;
-        packet->residency_address = reinterpret_cast<uint64_t>(&residency);
+        packet->chip_callable_address = reinterpret_cast<uint64_t>(image.data());
+        packet->chip_callable_bytes = image.size();
         packet->binding_address = identity.device_binding_addr;
         packet->context_generation = identity.context_generation + (invalid_binding ? 1 : 0);
         packet->sm_bytes = binding.sm.capacity;
@@ -497,7 +496,6 @@ TEST_F(TmrExecutorExecutionInputsTest, DispatchResolvesOnlyTheAdmittedCallablesC
     auto *callable = reinterpret_cast<ChipCallable *>(image.data());
     auto *resident_child = reinterpret_cast<CoreCallable *>(callable->storage_ + callable->child_offsets_[0]);
     resident_child->set_resolved_addr(reinterpret_cast<uint64_t>(resident_child->binary_data()));
-    KernelCallableDeviceResidency residency{reinterpret_cast<uint64_t>(image.data()), image.size(), 3, 0};
 
     resident->dev.gm_sm_ptr_ = binding.sm.base;
     resident->dev.prebuilt_arena_base_ = binding.arena.base;
@@ -513,6 +511,8 @@ TEST_F(TmrExecutorExecutionInputsTest, DispatchResolvesOnlyTheAdmittedCallablesC
     const size_t bytes = offsetof(SimplerKernelDispatchArgs, invocation) + invocation.size;
     std::vector<uint64_t> storage((bytes + sizeof(uint64_t) - 1) / sizeof(uint64_t));
     auto *packet = reinterpret_cast<SimplerKernelDispatchArgs *>(storage.data());
+    packet->chip_callable_address = reinterpret_cast<uint64_t>(image.data());
+    packet->chip_callable_bytes = image.size();
     packet->binding_address = binding.identity.device_binding_addr;
     packet->context_generation = binding.identity.context_generation;
     packet->sm_bytes = binding.sm.capacity;
@@ -522,14 +522,16 @@ TEST_F(TmrExecutorExecutionInputsTest, DispatchResolvesOnlyTheAdmittedCallablesC
         invocation.size
     );
     KernelDispatchGroup group;
-    ASSERT_EQ(admit_kernel_dispatch(*packet, residency, resident.get(), group), InvocationStatus::Ok);
+    ASSERT_EQ(admit_kernel_dispatch(*packet, *callable, image.size(), resident.get(), group), InvocationStatus::Ok);
     EXPECT_EQ(group.functions[function_id], reinterpret_cast<uint64_t>(resident_child));
     EXPECT_EQ(group.functions[function_id + 1], 0u);
     EXPECT_EQ(resident->dev.func_id_to_addr_[function_id], 0xdeadbeefu);
     release_kernel_execution();
 
     callable->child_offsets_[0] = static_cast<uint32_t>(image.size());
-    EXPECT_EQ(admit_kernel_dispatch(*packet, residency, resident.get(), group), InvocationStatus::InvalidBinding);
+    EXPECT_EQ(
+        admit_kernel_dispatch(*packet, *callable, image.size(), resident.get(), group), InvocationStatus::InvalidBinding
+    );
     EXPECT_EQ(kernel_execution_status(), -1);
 }
 
